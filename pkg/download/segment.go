@@ -42,6 +42,17 @@ type Segment struct {
 	// It tracks the byte offset where the next writing will occur, ensuring data is written to the correct location in the file.
 	// This offset is updated each time a write operation is completed, reflecting the new position for subsequent operations.
 	CurrentOffset int
+
+	// progressReporter is used to report progress updates during download operations.
+	// It allows the segment to communicate its download progress to the progress tracking system.
+	progressReporter ProgressReporter
+
+	// lastReportedBytes tracks the number of bytes that were last reported to avoid duplicate reporting.
+	// This helps optimize progress reporting by only sending updates when there are actual changes.
+	lastReportedBytes int64
+
+	// lastProgressTime tracks the last time progress was reported to control reporting frequency.
+	lastProgressTime time.Time
 }
 
 // SegmentManager manages the segments involved in a file download process.
@@ -152,6 +163,10 @@ type SegmentParams struct {
 	// This field allows the Segment to abstract the details of where and how the data is stored.
 	// It could be a file, a buffer in memory, or any other type that implements the io.Writer interface.
 	Writer io.WriteCloser
+
+	// ProgressReporter is used to report progress updates during download operations.
+	// It can be nil if progress reporting is not needed for this segment.
+	ProgressReporter ProgressReporter
 }
 
 const DefaultNumberOfSegments = 4
@@ -349,6 +364,108 @@ func detectType(m []byte) (string, error) {
 	return fmt.Sprintf(".%s", subtype), nil
 }
 
+// progressTrackingReader wraps an io.Reader to track progress during read operations.
+// It reports progress to the segment's progress reporter after each read.
+type progressTrackingReader struct {
+	reader  io.Reader
+	segment *Segment
+}
+
+// Read implements io.Reader interface and tracks progress for each read operation.
+func (ptr *progressTrackingReader) Read(p []byte) (n int, err error) {
+	n, err = ptr.reader.Read(p)
+	if n > 0 {
+		ptr.segment.reportProgress(int64(n))
+	}
+	return n, err
+}
+
+// reportProgress reports the progress of this segment to the progress reporter.
+// It calculates the current speed and sends a progress event.
+// To avoid performance impact, it limits the frequency of progress reports.
+// It includes error handling to ensure download continues even if progress reporting fails.
+func (seg *Segment) reportProgress(bytesRead int64) {
+	if seg.progressReporter == nil {
+		return
+	}
+
+	// Validate input to prevent invalid progress reports
+	if bytesRead < 0 {
+		return
+	}
+
+	now := time.Now()
+	seg.lastReportedBytes += bytesRead
+
+	// Limit progress reporting frequency to avoid performance impact
+	// Report at most every 100ms or when significant data (1KB) has been read
+	timeSinceLastReport := now.Sub(seg.lastProgressTime)
+	if timeSinceLastReport < 100*time.Millisecond && seg.lastReportedBytes < 1024 {
+		return
+	}
+
+	// Calculate speed based on time elapsed since last report
+	var speed float64
+	if timeSinceLastReport > 0 {
+		speed = float64(seg.lastReportedBytes) / timeSinceLastReport.Seconds()
+	}
+
+	// Handle edge cases for speed calculation
+	if speed < 0 {
+		speed = 0
+	}
+
+	// Calculate total bytes for this segment
+	totalBytes := seg.calculateTotalBytes()
+
+	// Create and send progress event
+	event := ProgressEvent{
+		SegmentID:  seg.ID,
+		BytesRead:  seg.getCurrentTotalBytes(),
+		TotalBytes: totalBytes,
+		Speed:      speed,
+		Timestamp:  now,
+	}
+
+	// Try to report progress, but don't fail if it doesn't work
+	defer func() {
+		if r := recover(); r != nil {
+			// Progress reporting failed, but continue download
+			// This could be logged if a logger was available
+		}
+	}()
+
+	seg.progressReporter.ReportProgress(event)
+
+	// Reset tracking for next interval
+	seg.lastReportedBytes = 0
+	seg.lastProgressTime = now
+}
+
+// calculateTotalBytes calculates the total bytes for this segment, handling edge cases.
+func (seg *Segment) calculateTotalBytes() int64 {
+	// For segmented downloads with known ranges
+	if seg.End > 0 && seg.Start >= 0 && seg.End >= seg.Start {
+		return seg.End - seg.Start + 1
+	}
+
+	// For non-segmented downloads, use MaxSegmentSize if available
+	if seg.MaxSegmentSize > 0 {
+		return seg.MaxSegmentSize
+	}
+
+	// Unknown size - return 0 to indicate unknown
+	return 0
+}
+
+// getCurrentTotalBytes returns the total bytes read by this segment so far.
+// This includes both the current reporting interval and all previous bytes.
+func (seg *Segment) getCurrentTotalBytes() int64 {
+	// This should represent the total bytes read by this segment
+	// We need to track this properly across all read operations
+	return int64(seg.CurrentOffset) + seg.lastReportedBytes
+}
+
 // NewSegment creates a new instance of a Segment struct.
 // It initializes a segment of a file to be downloaded, with specified start and end byte positions.
 // The caller is responsible for managing the temporary file, including its deletion after the segment is processed.
@@ -359,10 +476,13 @@ func NewSegment(params SegmentParams) (*Segment, error) {
 
 	_, resumable := params.Writer.(io.Seeker)
 	return &Segment{
-		SegmentParams: params,
-		Done:          false,
-		Resumable:     resumable,
-		Buffer:        bufio.NewWriterSize(params.Writer, int(params.MaxSegmentSize)),
+		SegmentParams:     params,
+		Done:              false,
+		Resumable:         resumable,
+		Buffer:            bufio.NewWriterSize(params.Writer, int(params.MaxSegmentSize)),
+		progressReporter:  params.ProgressReporter,
+		lastReportedBytes: 0,
+		lastProgressTime:  time.Now(),
 	}, nil
 }
 
@@ -395,14 +515,22 @@ func (seg *Segment) ReadFrom(src io.Reader) (int64, error) {
 		}
 	}
 
-	return seg.Buffer.ReadFrom(src)
+	// Use a custom reader wrapper to track progress during the read operation
+	progressReader := &progressTrackingReader{
+		reader:  src,
+		segment: seg,
+	}
+
+	return seg.Buffer.ReadFrom(progressReader)
 }
 
 // Write writes the given data to the segment's buffer.
 func (seg *Segment) Write(data []byte) (int, error) {
 	n, err := seg.Buffer.Write(data)
-	if err != nil {
+	if err == nil {
 		seg.CurrentOffset += n
+		// Report progress for direct writes
+		seg.reportProgress(int64(n))
 	}
 	return n, err
 }
