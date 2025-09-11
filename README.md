@@ -1,64 +1,113 @@
 # Durable Resume
 
-## Overview
-
-The Durable Resume Project is designed to offer a robust and efficient solution for downloading files over the internet. 
-With a focus on reliability and flexibility, it's particularly adept at handling large file downloads under various network conditions and server capabilities.
+A fast, reliable file downloader with automatic resume capability, parallel segmented downloading, and intelligent error handling.
 
 ## Key Features
 
-- **Segmented Downloading**: Employs dynamic segmentation for parallel downloading, enhancing speed and efficiency.
-- **Resume Capability**: Capable of resuming interrupted downloads, reducing data redundancy and saving time.
-- **Adaptive Segment Management**: Features a `SegmentManager` that can dynamically adjusts segment sizes and counts, optimizing for different network environments and file sizes.
-- **Range Request Support**: Utilizes server range request capabilities for efficient partial content fetching.
-- **Customizable Settings**: Offers adjustable segment counts and sizes, catering to diverse user needs.
+- **🚀 Simple CLI**: Just `dr <URL>` - no subcommands required
+- **⚡ Fast Downloads**: Parallel segments (1-32) with automatic resume
+- **�  Real-Time Progress**: Visual progress bar with speed and ETA
+- **🛡️ Smart Error Handling**: Clear, actionable error messages
+- **🔧 Flexible**: Supports HTTP/HTTPS/FTP, custom output paths, and scripting modes
+- **⚙️ Backward Compatible**: Works with existing scripts
 
-## Download 
+## Installation
 
 ```shell
 go install github.com/azhovan/durable-resume@latest
 ```
 
 ## Usage
-The following command download and save the context of the given file in the remote address in the current directory 
-and in a file called `some-files.pdf`
+
+### Basic Examples
+
 ```shell
-exmapleURL=https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf
-$ durable-resume download -u $exmapleURL --out=$(pwd) -f some-files
+# Download to current directory
+dr https://example.com/file.zip
 
+# Download to specific directory
+dr https://example.com/file.zip -o ~/Downloads
 
-# see help 
-$ durable-resume download -h 
+# Download with custom filename
+dr https://example.com/file.zip -o ~/Downloads -n myfile.zip
 
-download remote file and store it in a local directory
+# Fast download with more segments
+dr https://example.com/largefile.iso --segments 8
 
-Usage:
-  dr download --url [ADDRESS] --out [DIRECTORY] [flags]
+# Quiet mode for scripting
+dr https://example.com/config.json --quiet
 
-Flags:
-  -f, --file string         The downloaded file name
-  -h, --help                help for download
-  -o, --out string          The local file target directory to save file.
-  -n, --segment-count int   The number of segments for download a file. (default 4)
-  -s, --segment-size int    The size of each segment for download a file.
-  -u, --url string          The remote file address to download.
+# Verbose mode for debugging
+dr https://example.com/file.tar.gz --verbose
+```
 
+### Command Options
+
+```
+Usage: dr <URL> [options]
+
+  -o, --output string      Output path (directory or file)
+  -n, --name string        Custom filename
+  -c, --segments int       Parallel segments (1-32, default: 4)
+  -s, --segment-size int   Segment size in bytes (0 = auto)
+      --no-segments        Single-threaded download
+  -q, --quiet              Suppress progress output
+  -v, --verbose            Detailed logging
+  -r, --resume             Resume interrupted downloads (default: true)
+```
+
+## Progress Display
+
+Real-time progress with speed, data transfer, and ETA:
+
+```
+[===================>    ] 78.5% 45.2 MB/s 1.2GB/2.1GB ETA: 0m23s
 ```
 
 
+
+## Error Handling
+
+Clear, actionable error messages with solutions:
+
+```
+❌ Error: Invalid URL format - missing protocol
+
+URL: example.com/file.zip
+
+Did you mean:
+  https://example.com/file.zip
+  http://example.com/file.zip
+```
+
+## Legacy Support
+
+The old `download` subcommand still works with deprecation warnings:
+
+```shell
+# Legacy (deprecated)
+dr download --url https://example.com/file.zip --output ~/Downloads
+
+# New syntax
+dr https://example.com/file.zip -o ~/Downloads
+```
+
 ## Contributing
 
-Contributions are welcome! For details on how to contribute, please refer to our contributing guidelines.
+Contributions are welcome! Please refer to our contributing guidelines.
 
-*Add a link to contributing guidelines here.*
+## What's New in v2.0
+
+- **Simplified CLI**: Direct `dr <URL>` syntax (no subcommands)
+- **Real-Time Progress**: Visual progress bar with speed and ETA
+- **Smart Error Messages**: Clear, actionable error reporting
+- **Backward Compatible**: Legacy syntax still supported
 
 ## Roadmap
 
-* Implementing a progress bar.
-* Adjust segment sizes dynamically based on real-time download speeds and network conditions.
-* Allow users to pause and resume downloads at any time.
-* Enable users to schedule downloads for specific times.
-* Allow users to limit the download speed to avoid saturating the network.
-* Provide options to manage a queue of downloads.
-* Allow users to configure proxy servers or VPNs.
+- Dynamic segment adjustment based on network conditions
+- Configuration file support
+- Download queue management
+- Bandwidth limiting
+- Proxy/VPN support
 
