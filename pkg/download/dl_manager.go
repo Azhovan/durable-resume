@@ -23,16 +23,48 @@ type DownloadManager struct {
 	// ProgressTracker tracks and displays download progress across all segments.
 	ProgressTracker *ProgressTracker
 
+	// QuietMode suppresses progress output when enabled
+	QuietMode bool
+
+	// VerboseMode enables detailed logging when enabled
+	VerboseMode bool
+
 	Segm *SegmentManager
+}
+
+// DownloadManagerOption defines a function type for configuring a DownloadManager instance.
+type DownloadManagerOption func(*DownloadManager)
+
+// WithQuietMode is an option function that enables quiet mode for the DownloadManager.
+func WithQuietMode(quiet bool) DownloadManagerOption {
+	return func(dm *DownloadManager) {
+		dm.QuietMode = quiet
+	}
+}
+
+// WithVerboseMode is an option function that enables verbose mode for the DownloadManager.
+func WithVerboseMode(verbose bool) DownloadManagerOption {
+	return func(dm *DownloadManager) {
+		dm.VerboseMode = verbose
+	}
 }
 
 // NewDownloadManager creates a new instance of DownloadManager with the specified downloader
 // and retry policy. It returns a pointer to the DownloadManager.
-func NewDownloadManager(downloader *Downloader, retryPolicy *RetryPolicy) *DownloadManager {
-	return &DownloadManager{
+func NewDownloadManager(downloader *Downloader, retryPolicy *RetryPolicy, options ...DownloadManagerOption) *DownloadManager {
+	dm := &DownloadManager{
 		Downloader:  downloader,
 		RetryPolicy: retryPolicy,
+		QuietMode:   false,
+		VerboseMode: false,
 	}
+	
+	// Apply options
+	for _, opt := range options {
+		opt(dm)
+	}
+	
+	return dm
 }
 
 // Download initiates the download process.
@@ -55,14 +87,17 @@ func (dm *DownloadManager) Download(ctx context.Context, opts ...SegmentManagerO
 
 	// Initialize progress tracking
 	dm.ProgressTracker = NewProgressTracker(dm.Downloader.RangeSupport.ContentLength)
-	
-	// Create progress display and start progress tracking
-	progressDisplay := NewProgressDisplay(os.Stdout)
 	dm.ProgressTracker.Start()
 	
-	// Start progress display goroutine
-	progressDone := make(chan struct{})
-	go dm.displayProgress(progressDisplay, progressDone)
+	// Create progress display and start progress tracking (only if not in quiet mode)
+	var progressDisplay *ProgressDisplay
+	var progressDone chan struct{}
+	
+	if !dm.QuietMode {
+		progressDisplay = NewProgressDisplay(os.Stdout)
+		progressDone = make(chan struct{})
+		go dm.displayProgress(progressDisplay, progressDone)
+	}
 
 	// Pass progress reporter to each segment during initialization
 	for _, segment := range dm.Segm.Segments {
@@ -74,9 +109,13 @@ func (dm *DownloadManager) Download(ctx context.Context, opts ...SegmentManagerO
 		// Stop progress tracking
 		dm.ProgressTracker.Stop()
 		
-		// Signal progress display to stop and clean up
-		close(progressDone)
-		progressDisplay.Clear()
+		// Signal progress display to stop and clean up (only if not in quiet mode)
+		if !dm.QuietMode && progressDone != nil {
+			close(progressDone)
+			if progressDisplay != nil {
+				progressDisplay.Clear()
+			}
+		}
 	}()
 
 	// capture errors for each segment

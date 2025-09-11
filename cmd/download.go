@@ -1,15 +1,10 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
-	"os/signal"
-	"syscall"
 
-	"github.com/azhovan/durable-resume/pkg/download"
 	"github.com/spf13/cobra"
 )
 
@@ -29,81 +24,65 @@ func newDownloadCmd(output io.Writer) *cobra.Command {
 	var cmd = &cobra.Command{
 		Use:   "download --url [ADDRESS] --output [DIRECTORY]",
 		Short: "download remote file and store it in a local directory (DEPRECATED)",
+		Long: `DEPRECATED: This subcommand is deprecated and will be removed in a future version.
+
+Please use the new simplified syntax instead:
+  dr <URL> [options]
+
+Examples of new syntax:
+  dr https://example.com/file.zip
+  dr https://example.com/file.zip -o ~/Downloads
+  dr https://example.com/file.zip -o ~/Downloads -n myfile.zip
+
+The new syntax is shorter, more intuitive, and provides the same functionality.
+For full help on the new interface, run: dr --help
+
+This legacy command still works for backward compatibility but will show
+deprecation warnings during execution.`,
 		Args:  cobra.MaximumNArgs(4),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Convert legacy options to new CLIArgs structure
+			cliArgs := convertLegacyOptionsToArgs(opts)
+			
 			// Show deprecation warning when subcommand is used directly
 			showSubcommandDeprecationWarning(opts)
 			
-			// Continue with original logic
-			src, err := url.ParseRequestURI(opts.remoteURL)
-			if err != nil {
-				return fmt.Errorf("invalid remote url: %v", err)
-			}
-
-			downloader, err := download.NewDownloader(
-				opts.dstDIR,
-				src.String(),
-				download.WithFileName(opts.filename),
-			)
+			// Use the enhanced validation and error handling from the new system
+			config, err := cliArgs.ToDownloadConfig()
 			if err != nil {
 				return err
 			}
-
-			dm := download.NewDownloadManager(downloader, download.DefaultRetryPolicy())
-
-			// Create a context that can be cancelled on interrupt signals
-			ctx, cancel := context.WithCancel(cmd.Context())
-			defer cancel()
-
-			// Set up signal handling for graceful shutdown
-			sigChan := make(chan os.Signal, 1)
-			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-			// Start download in a goroutine
-			downloadDone := make(chan error, 1)
-			go func() {
-				downloadDone <- dm.Download(ctx, download.WithSegmentSize(opts.segSize), download.WithNumberOfSegments(opts.segCount))
-			}()
-
-			// Wait for either download completion or interrupt signal
-			select {
-			case err := <-downloadDone:
-				// Download completed (successfully or with error)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "\nDownload failed: %v\n", err)
-					return err
-				}
-				fmt.Println("\nDownload completed successfully!")
-				return nil
-
-			case sig := <-sigChan:
-				// User interrupted the download
-				fmt.Printf("\nReceived %v signal, stopping download...\n", sig)
-				cancel() // Cancel the download context
-				
-				// Wait a moment for graceful cleanup
-				select {
-				case err := <-downloadDone:
-					if err != nil && err != context.Canceled {
-						fmt.Fprintf(os.Stderr, "Download stopped with error: %v\n", err)
-					} else {
-						fmt.Println("Download stopped by user.")
-					}
-				case <-cmd.Context().Done():
-					fmt.Println("Download cleanup completed.")
-				}
-				return fmt.Errorf("download interrupted by user")
-			}
+			
+			// Execute using the unified download logic with enhanced features
+			return executeDownload(config)
 		},
 	}
 
 	cmd.Flags().StringVarP(&opts.remoteURL, "url", "u", "", "The remote file address to download.")
 	cmd.Flags().StringVarP(&opts.dstDIR, "output", "o", "", "The local file target directory to save file.")
 	cmd.Flags().Int64VarP(&opts.segSize, "segment-size", "s", 0, "The size of each segment for download a file.")
-	cmd.Flags().IntVarP(&opts.segCount, "segments", "c", download.DefaultNumberOfSegments, "The number of segments for download a file.")
+	cmd.Flags().IntVarP(&opts.segCount, "segments", "c", 4, "The number of segments for download a file.")
 	cmd.Flags().StringVarP(&opts.filename, "name", "n", "", "The downloaded file name")
 
 	return cmd
+}
+
+// convertLegacyOptionsToArgs converts legacy downloadOptions to new CLIArgs structure
+func convertLegacyOptionsToArgs(opts *downloadOptions) *CLIArgs {
+	cliArgs := NewCLIArgs()
+	cliArgs.URL = opts.remoteURL
+	cliArgs.Output = opts.dstDIR
+	cliArgs.Name = opts.filename
+	cliArgs.Segments = opts.segCount
+	cliArgs.SegmentSize = opts.segSize
+	cliArgs.Legacy = true
+	
+	// Legacy subcommand doesn't support quiet/verbose modes, use defaults
+	cliArgs.Quiet = false
+	cliArgs.Verbose = false
+	cliArgs.Resume = true // Default behavior
+	
+	return cliArgs
 }
 
 // showSubcommandDeprecationWarning shows deprecation warning for direct subcommand usage
@@ -135,7 +114,7 @@ func generateNewSyntaxFromOptions(opts *downloadOptions) string {
 		newCmd += fmt.Sprintf(" -n %s", opts.filename)
 	}
 	
-	if opts.segCount != download.DefaultNumberOfSegments {
+	if opts.segCount != 4 { // DefaultNumberOfSegments value
 		newCmd += fmt.Sprintf(" -c %d", opts.segCount)
 	}
 	
