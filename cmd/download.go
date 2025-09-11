@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/azhovan/durable-resume/pkg/download"
 	"github.com/spf13/cobra"
@@ -43,14 +47,49 @@ func newDownloadCmd(output io.Writer) *cobra.Command {
 
 			dm := download.NewDownloadManager(downloader, download.DefaultRetryPolicy())
 
-			fmt.Println("Downloading ...")
-			err = dm.Download(cmd.Context(), download.WithSegmentSize(opts.segSize), download.WithNumberOfSegments(opts.segCount))
-			if err != nil {
-				return err
-			}
-			fmt.Println("Download completed.")
+			// Create a context that can be cancelled on interrupt signals
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
 
-			return nil
+			// Set up signal handling for graceful shutdown
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+			// Start download in a goroutine
+			downloadDone := make(chan error, 1)
+			go func() {
+				downloadDone <- dm.Download(ctx, download.WithSegmentSize(opts.segSize), download.WithNumberOfSegments(opts.segCount))
+			}()
+
+			// Wait for either download completion or interrupt signal
+			select {
+			case err := <-downloadDone:
+				// Download completed (successfully or with error)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "\nDownload failed: %v\n", err)
+					return err
+				}
+				fmt.Println("\nDownload completed successfully!")
+				return nil
+
+			case sig := <-sigChan:
+				// User interrupted the download
+				fmt.Printf("\nReceived %v signal, stopping download...\n", sig)
+				cancel() // Cancel the download context
+				
+				// Wait a moment for graceful cleanup
+				select {
+				case err := <-downloadDone:
+					if err != nil && err != context.Canceled {
+						fmt.Fprintf(os.Stderr, "Download stopped with error: %v\n", err)
+					} else {
+						fmt.Println("Download stopped by user.")
+					}
+				case <-cmd.Context().Done():
+					fmt.Println("Download cleanup completed.")
+				}
+				return fmt.Errorf("download interrupted by user")
+			}
 		},
 	}
 
