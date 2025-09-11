@@ -27,10 +27,14 @@ func newDownloadCmd(output io.Writer) *cobra.Command {
 	var opts = &downloadOptions{}
 
 	var cmd = &cobra.Command{
-		Use:   "download --url [ADDRESS] --out [DIRECTORY]",
-		Short: "download remote file and store it in a local directory",
+		Use:   "download --url [ADDRESS] --output [DIRECTORY]",
+		Short: "download remote file and store it in a local directory (DEPRECATED)",
 		Args:  cobra.MaximumNArgs(4),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Show deprecation warning when subcommand is used directly
+			showSubcommandDeprecationWarning(opts)
+			
+			// Continue with original logic
 			src, err := url.ParseRequestURI(opts.remoteURL)
 			if err != nil {
 				return fmt.Errorf("invalid remote url: %v", err)
@@ -94,10 +98,50 @@ func newDownloadCmd(output io.Writer) *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&opts.remoteURL, "url", "u", "", "The remote file address to download.")
-	cmd.Flags().StringVarP(&opts.dstDIR, "out", "o", "", "The local file target directory to save file.")
+	cmd.Flags().StringVarP(&opts.dstDIR, "output", "o", "", "The local file target directory to save file.")
 	cmd.Flags().Int64VarP(&opts.segSize, "segment-size", "s", 0, "The size of each segment for download a file.")
-	cmd.Flags().IntVarP(&opts.segCount, "segment-count", "n", download.DefaultNumberOfSegments, "The number of segments for download a file.")
-	cmd.Flags().StringVarP(&opts.filename, "file", "f", "", "The downloaded file name")
+	cmd.Flags().IntVarP(&opts.segCount, "segments", "c", download.DefaultNumberOfSegments, "The number of segments for download a file.")
+	cmd.Flags().StringVarP(&opts.filename, "name", "n", "", "The downloaded file name")
 
 	return cmd
+}
+
+// showSubcommandDeprecationWarning shows deprecation warning for direct subcommand usage
+func showSubcommandDeprecationWarning(opts *downloadOptions) {
+	fmt.Fprintf(os.Stderr, "\n⚠️  DEPRECATION WARNING: The 'download' subcommand is deprecated and will be removed in a future version.\n\n")
+	
+	// Generate the new command syntax from the options
+	newCommand := generateNewSyntaxFromOptions(opts)
+	
+	fmt.Fprintf(os.Stderr, "Please use the new simplified syntax instead:\n")
+	fmt.Fprintf(os.Stderr, "  %s\n\n", newCommand)
+	
+	fmt.Fprintf(os.Stderr, "The new syntax is shorter and more intuitive. For more information, run: dr --help\n\n")
+}
+
+// generateNewSyntaxFromOptions generates new command syntax from downloadOptions
+func generateNewSyntaxFromOptions(opts *downloadOptions) string {
+	if opts.remoteURL == "" {
+		return "dr <URL> [options]"
+	}
+
+	newCmd := fmt.Sprintf("dr %s", opts.remoteURL)
+	
+	if opts.dstDIR != "" {
+		newCmd += fmt.Sprintf(" -o %s", opts.dstDIR)
+	}
+	
+	if opts.filename != "" {
+		newCmd += fmt.Sprintf(" -n %s", opts.filename)
+	}
+	
+	if opts.segCount != download.DefaultNumberOfSegments {
+		newCmd += fmt.Sprintf(" -c %d", opts.segCount)
+	}
+	
+	if opts.segSize != 0 {
+		newCmd += fmt.Sprintf(" -s %d", opts.segSize)
+	}
+	
+	return newCmd
 }
