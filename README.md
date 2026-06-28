@@ -40,6 +40,12 @@ dr https://example.com/file.zip --resume=false
 # Re-download even if the file already exists and is complete
 dr https://example.com/file.zip --force
 
+# Download several files into a directory
+dr https://example.com/a.zip https://example.com/b.zip -o ~/Downloads
+
+# Download every URL listed in a file (one per line; # comments allowed)
+dr -i urls.txt -o ~/Downloads
+
 # Verify integrity with sha256
 dr https://example.com/file.zip --checksum sha256:<hex>
 
@@ -59,6 +65,7 @@ dr https://example.com/file.tar.gz --verbose
 Usage: dr <url> [flags]
 
   -o, --output string        destination file or directory (default: Content-Disposition or URL name)
+  -i, --input-file string    read URLs from a file, one per line (blank/# lines skipped; - = stdin)
   -c, --concurrency int      number of parallel chunks (default 4)
       --resume               resume a previous interrupted download (default true)
   -f, --force                re-download even if the destination already exists
@@ -117,6 +124,23 @@ same-directory `os.Rename`). So the final path either does not exist yet or is a
 complete, verified file — an observer never sees a half-written or zero-holed
 file at the real name. On interruption or failure the `.part` is kept and the
 final path is left untouched.
+
+## Batch downloads
+
+Pass more than one URL — as positional arguments and/or from a file with
+`-i/--input-file` (one URL per line; blank lines and lines starting with `#` are
+ignored; `-` reads the list from stdin):
+
+```shell
+dr https://example.com/a.zip https://example.com/b.zip -o ~/Downloads
+dr -i urls.txt -o ~/Downloads
+```
+
+With multiple URLs, `-o` must be an existing directory (each file is named from
+its `Content-Disposition`/URL inside it) and `--checksum` is not allowed. The
+batch is *continue-on-error*: every URL is attempted, a summary is printed at the
+end (`dr: N of M downloads succeeded`, plus a line per failure), and `dr` exits
+non-zero if any download failed.
 
 ## Skipping completed downloads
 
