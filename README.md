@@ -22,11 +22,14 @@ go install github.com/azhovan/durable-resume@latest
 ### Basic Examples
 
 ```shell
-# Download to current directory (filename derived from the URL)
+# Download to current directory (filename from Content-Disposition or the URL)
 dr https://example.com/file.zip
 
 # Download to a specific path
 dr https://example.com/file.zip -o myfile.zip
+
+# Download into a directory (the filename is resolved automatically)
+dr https://example.com/download?id=42 -o ~/Downloads
 
 # More parallel chunks
 dr https://example.com/largefile.iso -c 8
@@ -52,7 +55,7 @@ dr https://example.com/file.tar.gz --verbose
 ```
 Usage: dr <url> [flags]
 
-  -o, --output string        destination path (default: derived from URL)
+  -o, --output string        destination file or directory (default: Content-Disposition or URL name)
   -c, --concurrency int      number of parallel chunks (default 4)
       --resume               resume a previous interrupted download (default true)
       --checksum string      verify with "sha256:<hex>"
@@ -66,6 +69,22 @@ Usage: dr <url> [flags]
 
 `--resume` defaults to `true`; pass `--resume=false` to disable it. Only `http`
 and `https` URLs are supported.
+
+### Output filename
+
+When `-o/--output` is omitted (or names an existing directory), `dr` chooses the
+filename like `curl -OJ` / `wget --content-disposition`, in this order:
+
+1. an explicit `-o <file>` path (used verbatim);
+2. the server's `Content-Disposition` filename, including the RFC 5987
+   `filename*` UTF-8 form;
+3. the basename of the **final** URL after redirects;
+4. the basename of the requested URL;
+5. `download` as a last resort.
+
+A server-supplied name is reduced to a single safe path component, so a malicious
+`Content-Disposition` cannot write outside the destination directory. On success
+`dr` prints `dr: saved to <path>` (unless `--quiet`).
 
 ## Progress Display
 

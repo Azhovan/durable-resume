@@ -77,7 +77,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 	}
 
 	flags := cmd.Flags()
-	flags.StringVarP(&output, "output", "o", "", "destination path (default: derived from URL)")
+	flags.StringVarP(&output, "output", "o", "", "destination file or directory (default: Content-Disposition or URL name)")
 	flags.IntVarP(&concurrency, "concurrency", "c", download.DefaultConcurrency, "number of parallel chunks")
 	flags.BoolVar(&resume, "resume", true, "resume a previous interrupted download")
 	flags.StringVar(&checksum, "checksum", "", `verify with "sha256:<hex>"`)
