@@ -53,7 +53,7 @@ func (c Checksum) Empty() bool {
 // Options is the fully-resolved configuration for one download. cmd/ builds it.
 type Options struct {
 	URL         string
-	Output      string        // destination path; cmd derives the default
+	Output      string        // raw user -o/--output value: "" (derive after probe), an existing directory (place derived name inside), or a normal path (verbatim). Run resolves it to the final path after probe.
 	Concurrency int           // parallel chunks; clamped to >=1 inside Run
 	Resume      bool          // false when --no-resume
 	Checksum    Checksum      // optional sha256 verification
@@ -91,13 +91,43 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	vlogf(opts, "probe: size=%d acceptRanges=%t etag=%q lastModified=%q", info.size, info.acceptRanges, info.etag, info.lastModified)
 
-	// 2. STRATEGY
+	// 2. RESOLVE OUTPUT PATH (single source of truth; uses Content-Disposition and
+	// the post-redirect final URL captured by the probe). opts is a value copy
+	// local to Run; mutating opts.Output makes statePath/dest-open/resume/verify
+	// all consistent on the resolved path.
+	resolved, err := resolveOutputPath(opts.Output, info, opts.URL)
+	if err != nil {
+		return fmt.Errorf("download: resolve output path: %w", err)
+	}
+	opts.Output = resolved
+	vlogf(opts, "output: resolved %q (cd=%q finalURL=%q)", resolved, info.contentDisposition, info.finalURL)
+
+	// 3. STRATEGY
 	if !info.streamable() {
 		vlogf(opts, "strategy: single sequential stream (no ranges or unknown size)")
-		return runSingleStream(ctx, client, opts, info)
+		if err := runSingleStream(ctx, client, opts, info); err != nil {
+			return err
+		}
+		savedf(opts)
+		return nil
 	}
 	vlogf(opts, "strategy: segmented download with concurrency=%d", concurrency)
-	return runSegmentedDownload(ctx, client, opts, info, concurrency)
+	if err := runSegmentedDownload(ctx, client, opts, info, concurrency); err != nil {
+		return err
+	}
+	savedf(opts)
+	return nil
+}
+
+// savedf prints "dr: saved to <path>" to opts.Out unless --quiet (independent of
+// --verbose). No-op when Out is nil. Distinct from vlogf so it shows without -v.
+// Called on the success path after the strategy's deferred prog.Stop() has
+// flushed, so the line never interleaves with the live progress render.
+func savedf(opts Options) {
+	if opts.Quiet || opts.Out == nil {
+		return
+	}
+	fmt.Fprintf(opts.Out, "dr: saved to %s\n", opts.Output)
 }
 
 // runSingleStream handles the non-streamable path: a single sequential stream

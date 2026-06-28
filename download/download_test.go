@@ -94,6 +94,167 @@ func TestRunRangedEndToEnd(t *testing.T) {
 	assert.True(t, os.IsNotExist(statErr), "sidecar should be removed on success")
 }
 
+func TestRunResolvesContentDispositionName(t *testing.T) {
+	t.Parallel()
+	payload := []byte(strings.Repeat("derived-", 5000))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Content-Disposition should win over the URL basename.
+		w.Header().Set("Content-Disposition", `attachment; filename="derived.bin"`)
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		rh := r.Header.Get("Range")
+		if rh == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
+		start, end := parseRange(t, rh, len(payload))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+
+	// Capture the "saved to" line via a temp file used as Out (Options.Out is *os.File).
+	outFile, err := os.CreateTemp(dir, "out-*.log")
+	require.NoError(t, err)
+	defer outFile.Close()
+
+	opts := baseOpts(t, srv.URL+"/some/path/url-name.bin", dir)
+	opts.Client = srv.Client()
+	opts.Quiet = false
+	opts.Out = outFile
+
+	require.NoError(t, Run(context.Background(), opts))
+
+	want := filepath.Join(dir, "derived.bin")
+	got, err := os.ReadFile(want)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+
+	logged, err := os.ReadFile(outFile.Name())
+	require.NoError(t, err)
+	assert.Contains(t, string(logged), "dr: saved to "+want)
+}
+
+func TestRunSavedLineSuppressedUnderQuiet(t *testing.T) {
+	t.Parallel()
+	payload := []byte(strings.Repeat("quiet-", 5000))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="q.bin"`)
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		rh := r.Header.Get("Range")
+		if rh == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
+		start, end := parseRange(t, rh, len(payload))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	outFile, err := os.CreateTemp(dir, "out-*.log")
+	require.NoError(t, err)
+	defer outFile.Close()
+
+	opts := baseOpts(t, srv.URL, dir)
+	opts.Client = srv.Client()
+	opts.Quiet = true
+	opts.Out = outFile
+
+	require.NoError(t, Run(context.Background(), opts))
+
+	// The file must still land at the resolved dir-join path under quiet; the
+	// quiet flag only suppresses the "saved to" line, not the resolution itself.
+	want := filepath.Join(dir, "q.bin")
+	got, err := os.ReadFile(want)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+
+	logged, err := os.ReadFile(outFile.Name())
+	require.NoError(t, err)
+	assert.NotContains(t, string(logged), "saved to")
+}
+
+// TestRunResolvesFinalURLBasenameAfterRedirect drives the spec's headline gap end
+// to end: a 302 redirect to a CDN-style path whose basename is the real filename,
+// with NO Content-Disposition. The saved file must be named from the FINAL
+// (post-redirect) URL, proving Run resolves against info.finalURL rather than the
+// originally-requested URL.
+func TestRunResolvesFinalURLBasenameAfterRedirect(t *testing.T) {
+	t.Parallel()
+	payload := []byte(strings.Repeat("iso-bytes-", 5000))
+	const realName = "ubuntu-24.04.iso"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/real/"+realName, http.StatusFound)
+			return
+		}
+		// Target: ranged 206 body, deliberately NO Content-Disposition so the
+		// name can only come from this final URL's basename.
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		rh := r.Header.Get("Range")
+		if rh == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
+		start, end := parseRange(t, rh, len(payload))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	opts := baseOpts(t, srv.URL+"/start", dir)
+	opts.Client = srv.Client() // follows the redirect
+
+	require.NoError(t, Run(context.Background(), opts))
+
+	want := filepath.Join(dir, realName)
+	got, err := os.ReadFile(want)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+}
+
+// TestRunResolvesURLBasenameWithoutContentDisposition exercises precedence rung (c)
+// through Run: an existing-directory Output, a URL ending in a real filename, and a
+// server emitting no Content-Disposition. The saved file must be named from the URL
+// path basename.
+func TestRunResolvesURLBasenameWithoutContentDisposition(t *testing.T) {
+	t.Parallel()
+	payload := []byte(strings.Repeat("url-name-", 5000))
+	srv := rangedServer(t, payload, `"v1"`)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	opts := baseOpts(t, srv.URL+"/downloads/file-name.iso", dir)
+	opts.Client = srv.Client()
+
+	require.NoError(t, Run(context.Background(), opts))
+
+	want := filepath.Join(dir, "file-name.iso")
+	got, err := os.ReadFile(want)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+}
+
 func TestRunNoRangeSingleStream(t *testing.T) {
 	t.Parallel()
 	payload := []byte(strings.Repeat("no-range-", 4000))

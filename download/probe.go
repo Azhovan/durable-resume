@@ -10,10 +10,12 @@ import (
 
 // remoteInfo is what a single probe learns about the resource.
 type remoteInfo struct {
-	size         int64  // -1 when unknown
-	acceptRanges bool   // true only when a ranged GET returned 206 (or HEAD advertised bytes)
-	etag         string // raw ETag header, may be ""
-	lastModified string // raw Last-Modified header, may be ""
+	size               int64  // -1 when unknown
+	acceptRanges       bool   // true only when a ranged GET returned 206 (or HEAD advertised bytes)
+	etag               string // raw ETag header, may be ""
+	lastModified       string // raw Last-Modified header, may be ""
+	contentDisposition string // raw Content-Disposition header value (untrusted), may be ""
+	finalURL           string // resp.Request.URL.String() after redirects; falls back to requested URL
 }
 
 // streamable reports whether the segmented strategy is usable (ranges + known size).
@@ -37,9 +39,11 @@ func probe(ctx context.Context, c *http.Client, url string, hdr http.Header) (re
 	defer drainAndClose(resp.Body)
 
 	info := remoteInfo{
-		size:         -1,
-		etag:         resp.Header.Get("ETag"),
-		lastModified: resp.Header.Get("Last-Modified"),
+		size:               -1,
+		etag:               resp.Header.Get("ETag"),
+		lastModified:       resp.Header.Get("Last-Modified"),
+		contentDisposition: resp.Header.Get("Content-Disposition"),
+		finalURL:           finalURLOf(resp, url),
 	}
 
 	switch {
@@ -90,7 +94,24 @@ func headFallback(ctx context.Context, c *http.Client, url string, hdr http.Head
 	if v := resp.Header.Get("Last-Modified"); v != "" {
 		info.lastModified = v
 	}
+	// Content-Disposition: only override when the HEAD response provides one, so a
+	// CD captured from the GET response survives a metadata-less HEAD.
+	if v := resp.Header.Get("Content-Disposition"); v != "" {
+		info.contentDisposition = v
+	}
+	// finalURL always reflects the HEAD response: it is the later post-redirect
+	// request, and finalURLOf already falls back to the requested url.
+	info.finalURL = finalURLOf(resp, url)
 	return info, nil
+}
+
+// finalURLOf returns the post-redirect URL string, falling back to requested when
+// the response carries no usable request URL (defensive; real responses always do).
+func finalURLOf(resp *http.Response, requested string) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.String()
+	}
+	return requested
 }
 
 // parseContentLength parses a Content-Length header value, returning -1 when

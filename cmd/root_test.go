@@ -134,34 +134,6 @@ func TestParseChecksum(t *testing.T) {
 	}
 }
 
-func TestDefaultOutputName(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		rawURL string
-		want   string
-	}{
-		{name: "basename from path", rawURL: "https://example.com/path/file.bin", want: "file.bin"},
-		{name: "single segment", rawURL: "https://example.com/file.tar.gz", want: "file.tar.gz"},
-		{name: "trailing slash", rawURL: "https://example.com/path/", want: "download"},
-		{name: "root only", rawURL: "https://example.com/", want: "download"},
-		{name: "no path", rawURL: "https://example.com", want: "download"},
-		{name: "query ignored", rawURL: "https://example.com/file.bin?x=1", want: "file.bin"},
-		{name: "dotdot basename", rawURL: "https://example.com/..", want: "download"},
-		{name: "encoded dotdot", rawURL: "https://example.com/%2e%2e", want: "download"},
-		{name: "nested dotdot", rawURL: "https://example.com/sub/%2e%2e", want: "download"},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tt.want, defaultOutputName(tt.rawURL))
-		})
-	}
-}
-
 func TestFormatVersion(t *testing.T) {
 	t.Parallel()
 	s := formatVersion("1.2.3", "abc123", "2026-06-28")

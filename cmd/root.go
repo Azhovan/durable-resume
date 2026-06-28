@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"strings"
 	"syscall"
 
@@ -56,14 +55,9 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				return err
 			}
 
-			out := output
-			if out == "" {
-				out = defaultOutputName(rawURL)
-			}
-
 			opts := download.Options{
 				URL:         rawURL,
-				Output:      out,
+				Output:      output,
 				Concurrency: concurrency,
 				Resume:      resume,
 				Checksum:    sum,
@@ -144,24 +138,6 @@ func parseChecksum(s string) (download.Checksum, error) {
 		return download.Checksum{}, fmt.Errorf("invalid sha256 digest %q: expected 64 hex characters, got %d", digest, len(digest))
 	}
 	return download.Checksum{Algo: algo, Hex: digest}, nil
-}
-
-// defaultOutputName derives the output filename from the URL path; falls back to
-// "download" when the path is empty or ends in a slash.
-func defaultOutputName(rawURL string) string {
-	const fallback = "download"
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fallback
-	}
-	if u.Path == "" || strings.HasSuffix(u.Path, "/") {
-		return fallback
-	}
-	base := path.Base(u.Path)
-	if base == "." || base == ".." || base == "/" || base == "" {
-		return fallback
-	}
-	return base
 }
 
 // validateURL ensures rawURL parses and uses the http or https scheme.

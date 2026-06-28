@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -116,6 +117,89 @@ func TestProbe(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProbeCapturesContentDispositionAndFinalURL(t *testing.T) {
+	t.Parallel()
+
+	t.Run("non-redirect 206 captures cd and finalURL", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Range", "bytes 0-0/1000")
+			w.Header().Set("Content-Disposition", `attachment; filename="ubuntu.iso"`)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("x"))
+		}))
+		defer srv.Close()
+
+		info, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+		require.NoError(t, err)
+		assert.Equal(t, `attachment; filename="ubuntu.iso"`, info.contentDisposition)
+		assert.Equal(t, srv.URL, info.finalURL)
+	})
+
+	t.Run("302 redirect finalURL is post-redirect", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/start":
+				http.Redirect(w, r, "/real/ubuntu.iso", http.StatusFound)
+			case "/real/ubuntu.iso":
+				w.Header().Set("Content-Range", "bytes 0-0/1000")
+				w.Header().Set("Content-Disposition", `attachment; filename="server.iso"`)
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte("x"))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		info, err := probe(context.Background(), srv.Client(), srv.URL+"/start", nil)
+		require.NoError(t, err)
+		assert.True(t, strings.HasSuffix(info.finalURL, "/real/ubuntu.iso"), "finalURL=%q", info.finalURL)
+		assert.Equal(t, `attachment; filename="server.iso"`, info.contentDisposition)
+	})
+
+	t.Run("HEAD fallback carries cd and sets finalURL", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				w.Header().Set("Content-Length", "2048")
+				w.Header().Set("Content-Disposition", `attachment; filename="head.bin"`)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}))
+		defer srv.Close()
+
+		info, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+		require.NoError(t, err)
+		assert.Equal(t, `attachment; filename="head.bin"`, info.contentDisposition)
+		assert.Equal(t, srv.URL, info.finalURL)
+	})
+
+	t.Run("GET-set cd survives a cd-less HEAD fallback", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				// HEAD provides size but no Content-Disposition.
+				w.Header().Set("Content-Length", "2048")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			// The GET (probe) sets a CD then returns a non-streamable status.
+			w.Header().Set("Content-Disposition", `attachment; filename="get.bin"`)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}))
+		defer srv.Close()
+
+		info, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+		require.NoError(t, err)
+		assert.Equal(t, `attachment; filename="get.bin"`, info.contentDisposition)
+		assert.NotEmpty(t, info.finalURL)
+	})
 }
 
 func TestProbeTransportErrorPropagates(t *testing.T) {
