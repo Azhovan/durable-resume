@@ -158,7 +158,7 @@ func defaultOutputName(rawURL string) string {
 		return fallback
 	}
 	base := path.Base(u.Path)
-	if base == "." || base == "/" || base == "" {
+	if base == "." || base == ".." || base == "/" || base == "" {
 		return fallback
 	}
 	return base

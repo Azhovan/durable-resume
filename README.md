@@ -4,12 +4,12 @@ A fast, reliable file downloader with automatic resume capability, parallel segm
 
 ## Key Features
 
-- **🚀 Simple CLI**: Just `dr <URL>` - no subcommands required
-- **⚡ Fast Downloads**: Parallel segments (1-32) with automatic resume
-- **�  Real-Time Progress**: Visual progress bar with speed and ETA
-- **🛡️ Smart Error Handling**: Clear, actionable error messages
-- **🔧 Flexible**: Supports HTTP/HTTPS/FTP, custom output paths, and scripting modes
-- **⚙️ Backward Compatible**: Works with existing scripts
+- **Simple CLI**: Just `dr <URL>` - no subcommands required
+- **Fast Downloads**: Parallel chunks with true durable resume
+- **Real-Time Progress**: Live progress with speed and ETA (TTY only)
+- **Smart Error Handling**: Clear, actionable error messages
+- **Flexible**: HTTP/HTTPS, custom output paths, custom headers, and quiet mode for scripting
+- **Integrity**: Final size check plus optional sha256 verification
 
 ## Installation
 
@@ -22,17 +22,23 @@ go install github.com/azhovan/durable-resume@latest
 ### Basic Examples
 
 ```shell
-# Download to current directory
+# Download to current directory (filename derived from the URL)
 dr https://example.com/file.zip
 
-# Download to specific directory
-dr https://example.com/file.zip -o ~/Downloads
+# Download to a specific path
+dr https://example.com/file.zip -o myfile.zip
 
-# Download with custom filename
-dr https://example.com/file.zip -o ~/Downloads -n myfile.zip
+# Faster download with more parallel chunks
+dr https://example.com/largefile.iso -c 8
 
-# Fast download with more segments
-dr https://example.com/largefile.iso --segments 8
+# Disable resume (start fresh, ignore any sidecar)
+dr https://example.com/file.zip --resume=false
+
+# Verify integrity with sha256
+dr https://example.com/file.zip --checksum sha256:<hex>
+
+# Send custom request headers (repeatable)
+dr https://example.com/file.zip -H "Authorization: Bearer <token>"
 
 # Quiet mode for scripting
 dr https://example.com/config.json --quiet
@@ -44,17 +50,20 @@ dr https://example.com/file.tar.gz --verbose
 ### Command Options
 
 ```
-Usage: dr <URL> [options]
+Usage: dr <url> [flags]
 
-  -o, --output string      Output path (directory or file)
-  -n, --name string        Custom filename
-  -c, --segments int       Parallel segments (1-32, default: 4)
-  -s, --segment-size int   Segment size in bytes (0 = auto)
-      --no-segments        Single-threaded download
-  -q, --quiet              Suppress progress output
-  -v, --verbose            Detailed logging
-  -r, --resume             Resume interrupted downloads (default: true)
+  -o, --output string        Destination path (default: derived from URL)
+  -c, --concurrency int      Number of parallel chunks (default: 4)
+      --resume               Resume a previous interrupted download (default: true; use --resume=false to disable)
+      --checksum string      Verify with "sha256:<hex>"
+      --timeout duration     Per-request HTTP timeout (0 = none) (default: 30s)
+      --retries int          Per-chunk retry attempts (default: 3)
+  -H, --header stringArray   Extra request header "Key: Value" (repeatable)
+  -q, --quiet                Suppress progress output
+  -v, --verbose              Extra logging
 ```
+
+Only `http` and `https` URLs are supported.
 
 ## Progress Display
 
@@ -80,18 +89,6 @@ Did you mean:
   http://example.com/file.zip
 ```
 
-## Legacy Support
-
-The old `download` subcommand still works with deprecation warnings:
-
-```shell
-# Legacy (deprecated)
-dr download --url https://example.com/file.zip --output ~/Downloads
-
-# New syntax
-dr https://example.com/file.zip -o ~/Downloads
-```
-
 ## Contributing
 
 Contributions are welcome! Please refer to our contributing guidelines.
@@ -99,9 +96,9 @@ Contributions are welcome! Please refer to our contributing guidelines.
 ## What's New in v2.0
 
 - **Simplified CLI**: Direct `dr <URL>` syntax (no subcommands)
-- **Real-Time Progress**: Visual progress bar with speed and ETA
+- **True Durable Resume**: Per-chunk cursors persisted to a sidecar; resumes via HTTP Range
+- **Real-Time Progress**: Live progress with speed and ETA
 - **Smart Error Messages**: Clear, actionable error reporting
-- **Backward Compatible**: Legacy syntax still supported
 
 ## Roadmap
 

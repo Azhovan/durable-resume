@@ -31,7 +31,6 @@ const (
 var (
 	ErrNoURL             = errors.New("download: no url provided")
 	ErrUnsupportedScheme = errors.New("download: only http and https are supported")
-	ErrNoLength          = errors.New("download: server did not report content length")
 	ErrRemoteChanged     = errors.New("download: remote changed since saved state; cannot resume")
 	ErrSizeMismatch      = errors.New("download: downloaded size does not match expected size")
 	ErrChecksumMismatch  = errors.New("download: checksum mismatch")
@@ -90,11 +89,14 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("download: probe: %w", err)
 	}
+	vlogf(opts, "probe: size=%d acceptRanges=%t etag=%q lastModified=%q", info.size, info.acceptRanges, info.etag, info.lastModified)
 
 	// 2. STRATEGY
 	if !info.streamable() {
+		vlogf(opts, "strategy: single sequential stream (no ranges or unknown size)")
 		return runSingleStream(ctx, client, opts, info)
 	}
+	vlogf(opts, "strategy: segmented download with concurrency=%d", concurrency)
 	return runSegmentedDownload(ctx, client, opts, info, concurrency)
 }
 
@@ -106,7 +108,12 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	if err != nil {
 		return fmt.Errorf("download: open destination: %w", err)
 	}
-	defer dst.Close()
+	// Guard against the explicit Close below racing this deferred cleanup close.
+	defer func() {
+		if dst != nil {
+			_ = dst.Close()
+		}
+	}()
 
 	prog := NewProgress(info.size, opts.Out, opts.Quiet)
 	prog.Start(ctx)
@@ -114,7 +121,17 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 
 	onBytes := func(n int64) { prog.Add(n) }
 
-	if _, err := runSingle(ctx, client, opts.URL, opts.Header, dst, onBytes); err != nil {
+	// The single-stream path has no resume sidecar to fall back on, so wrap it in
+	// the same retry policy as segmented chunks. runSingle truncates dst to 0 and
+	// restarts from offset 0 each attempt, so a retry is idempotent for output
+	// correctness; reset the progress counter so partial bytes are not counted twice.
+	retry := newRetry(opts.MaxRetries, 1*time.Millisecond, nil)
+	err = retry(ctx, func() error {
+		prog.Seed(0)
+		_, runErr := runSingle(ctx, client, opts.URL, opts.Header, dst, onBytes)
+		return runErr
+	})
+	if err != nil {
 		return err
 	}
 
@@ -125,6 +142,7 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	if err := dst.Close(); err != nil {
 		return fmt.Errorf("download: close destination: %w", err)
 	}
+	dst = nil // prevent the deferred close from running on an already-closed file
 	if err := verifyChecksum(opts.Output, opts.Checksum); err != nil {
 		return err
 	}
@@ -148,20 +166,32 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 			return fmt.Errorf("download: load state: %w", err)
 		}
 		if saved != nil {
-			if !saved.Matches(info) {
-				// Distinguish "remote changed" from "no validator / size differs".
-				if (saved.ETag != "" && info.etag != "") || (saved.LastModified != "" && info.lastModified != "") {
-					return fmt.Errorf("download: etag %q vs %q: %w", saved.ETag, info.etag, ErrRemoteChanged)
-				}
+			switch {
+			case !saved.Matches(info):
+				// Distinguish "remote changed (size)" from "remote changed
+				// (validator)" from "no usable validator". Check size first so a
+				// pure size change is not misreported as an ETag mismatch.
 				if saved.Size != info.size {
 					return fmt.Errorf("download: size %d vs %d: %w", saved.Size, info.size, ErrRemoteChanged)
 				}
+				if (saved.ETag != "" && info.etag != "") || (saved.LastModified != "" && info.lastModified != "") {
+					return fmt.Errorf("download: etag %q vs %q: %w", saved.ETag, info.etag, ErrRemoteChanged)
+				}
 				// No usable validator: discard and start fresh.
+				vlogf(opts, "resume: sidecar has no usable validator; discarding and starting fresh")
 				saved = nil
-			} else {
+			case !partialFileUsable(opts.Output, saved.Size):
+				// The sidecar survived but the on-disk data file is missing or no
+				// longer matches the pre-allocated size. Trusting the per-chunk
+				// done cursors now would skip already-"done" chunks and deliver a
+				// sparse, zero-holed file as a success. Discard and start fresh.
+				vlogf(opts, "resume: on-disk file missing or wrong size; discarding sidecar and starting fresh")
+				saved = nil
+			default:
 				st = saved
 				chunks = saved.toChunks()
 				resumed = true
+				vlogf(opts, "resume: honoring sidecar; %d of %d bytes already complete", saved.completedBytes(), info.size)
 			}
 		}
 	}
@@ -172,25 +202,24 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 		st = newState(opts.URL, info, concurrency, chunks)
 	}
 
-	// 4. open destination: truncate to pre-allocate on fresh; no truncation on resume.
-	var dst *os.File
-	var err error
-	if resumed {
-		dst, err = os.OpenFile(opts.Output, os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			return fmt.Errorf("download: open destination: %w", err)
-		}
-	} else {
-		dst, err = os.OpenFile(opts.Output, os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			return fmt.Errorf("download: open destination: %w", err)
-		}
+	// 4. open destination: truncate to pre-allocate on fresh; no truncation on
+	// resume (the on-disk size was validated above before honoring the cursors).
+	dst, err := os.OpenFile(opts.Output, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("download: open destination: %w", err)
+	}
+	if !resumed {
 		if err := dst.Truncate(info.size); err != nil {
 			dst.Close()
 			return fmt.Errorf("download: pre-allocate destination: %w", err)
 		}
 	}
-	defer dst.Close()
+	// Guard against the explicit Close below racing this deferred cleanup close.
+	defer func() {
+		if dst != nil {
+			_ = dst.Close()
+		}
+	}()
 
 	// 5. PROGRESS
 	prog := NewProgress(info.size, opts.Out, opts.Quiet)
@@ -228,6 +257,7 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 	if err := dst.Close(); err != nil {
 		return fmt.Errorf("download: close destination: %w", err)
 	}
+	dst = nil // prevent the deferred close from running on an already-closed file
 	if err := verifyChecksum(opts.Output, opts.Checksum); err != nil {
 		return err
 	}
@@ -250,6 +280,33 @@ func validateScheme(rawURL string) error {
 	default:
 		return fmt.Errorf("download: scheme %q: %w", u.Scheme, ErrUnsupportedScheme)
 	}
+}
+
+// partialFileUsable reports whether the existing destination file is consistent
+// with a sidecar whose chunk done-cursors will be trusted on resume. The fresh
+// run pre-allocates the file with Truncate(size), so a resumable partial file
+// must still exist with exactly that on-disk size. A missing, truncated, or
+// otherwise resized file means the cursors can no longer be trusted (resuming
+// would skip "done" chunks and leave zero holes), so the caller must restart.
+func partialFileUsable(output string, size int64) bool {
+	if size <= 0 {
+		// Unknown/zero size is never the segmented (pre-allocated) path.
+		return false
+	}
+	fi, err := os.Stat(output)
+	if err != nil {
+		return false
+	}
+	return fi.Size() == size
+}
+
+// vlogf writes a diagnostic line to opts.Out when opts.Verbose is set. It is a
+// no-op under --quiet, when Verbose is false, or when Out is nil.
+func vlogf(opts Options, format string, args ...any) {
+	if !opts.Verbose || opts.Quiet || opts.Out == nil {
+		return
+	}
+	fmt.Fprintf(opts.Out, "dr: "+format+"\n", args...)
 }
 
 // httpClient returns opts.Client or a default *http.Client built from opts.Timeout.

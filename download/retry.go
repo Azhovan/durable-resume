@@ -119,7 +119,9 @@ func isRetryable(err error) bool {
 		return false
 	}
 
-	// HTTP status classification.
+	// HTTP status classification. Checked before the ErrRangeNot206 sentinel so a
+	// non-206 chunk response (which wraps both) is classified by its status code:
+	// 5xx/429 retry, 200/4xx fail fast.
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) {
 		code := statusErr.StatusCode()
@@ -130,6 +132,17 @@ func isRetryable(err error) bool {
 			return true
 		}
 		// All other client/redirect/informational statuses are fatal.
+		return false
+	}
+
+	// A range/protocol violation carrying no status (e.g. an over-length 206) can
+	// never succeed by retrying; fatal.
+	if errors.Is(err, ErrRangeNot206) {
+		return false
+	}
+
+	// A local write failure (ENOSPC, short write, etc.) is not transient; fatal.
+	if errors.Is(err, io.ErrShortWrite) {
 		return false
 	}
 

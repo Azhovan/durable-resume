@@ -88,18 +88,33 @@ func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("download: chunk %d got status %d: %w", ch.index, resp.StatusCode, ErrRangeNot206)
+		// Carry the status code so retry classification can fail fast on a
+		// permanent status (200/4xx) while still retrying transient 5xx/429.
+		return fmt.Errorf("download: chunk %d got status %d: %w: %w",
+			ch.index, resp.StatusCode, ErrRangeNot206, &httpStatusError{code: resp.StatusCode})
 	}
 
+	// want is the number of bytes still owed for this chunk's range. Reads are
+	// capped to this so a misbehaving server that over-delivers cannot spill past
+	// ch.end into the next (disjoint) chunk's region, where an unlocked WriteAt
+	// would race a neighbouring worker.
+	want := ch.end - (ch.start + ch.done) + 1
 	buf := make([]byte, copyBufferSize)
 	for {
 		nr, rerr := resp.Body.Read(buf)
 		if nr > 0 {
+			n := int64(nr)
+			if n > want {
+				// Protocol violation: the server returned more than the requested
+				// range. Refuse to write the surplus; fail fatally.
+				return fmt.Errorf("download: chunk %d over-length 206 response: %w", ch.index, ErrRangeNot206)
+			}
 			// Absolute offset advances as ch.done advances.
 			at := ch.start + ch.done
-			nw, werr := w.WriteAt(buf[:nr], at)
+			nw, werr := w.WriteAt(buf[:n], at)
 			if nw > 0 {
 				ch.done += int64(nw)
+				want -= int64(nw)
 				if onBytes != nil {
 					onBytes(int64(nw))
 				}
@@ -107,7 +122,7 @@ func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header
 			if werr != nil {
 				return fmt.Errorf("download: write chunk %d: %w", ch.index, werr)
 			}
-			if nw < nr {
+			if int64(nw) < n {
 				return fmt.Errorf("download: short write chunk %d: %w", ch.index, io.ErrShortWrite)
 			}
 		}
@@ -117,6 +132,14 @@ func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header
 		if rerr != nil {
 			return fmt.Errorf("download: read chunk %d: %w", ch.index, rerr)
 		}
+	}
+
+	// A clean EOF that delivered fewer bytes than the requested range is a
+	// mid-stream truncation (e.g. a connection-close-framed 206). Surface it as a
+	// retryable short read so the chunk resumes from its advanced done cursor
+	// rather than failing the whole download.
+	if want > 0 {
+		return fmt.Errorf("download: chunk %d short read, %d bytes missing: %w", ch.index, want, io.ErrUnexpectedEOF)
 	}
 
 	return nil

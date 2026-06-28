@@ -143,7 +143,10 @@ func runSingle(ctx context.Context, c *http.Client, url string, hdr http.Header,
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+	// This path never sends a Range header, so only 200 is valid. A 206 here is
+	// anomalous (a non-conformant server/intermediary) and would deliver only a
+	// partial body that we would otherwise write as the complete file.
+	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("download: unexpected status %d: %w", resp.StatusCode, &httpStatusError{code: resp.StatusCode})
 	}
 

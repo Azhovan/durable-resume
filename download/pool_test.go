@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -165,6 +166,9 @@ func TestRunSegmented_ContextCancelReturnsPromptly(t *testing.T) {
 	case err := <-done:
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.Canceled)
+		// The cancel must propagate unwrapped, NOT classified as ErrChunkFailed.
+		assert.False(t, errors.Is(err, ErrChunkFailed),
+			"context cancellation must not be wrapped in ErrChunkFailed")
 	case <-time.After(3 * time.Second):
 		t.Fatal("runSegmented did not return promptly after cancel (possible goroutine leak/hang)")
 	}

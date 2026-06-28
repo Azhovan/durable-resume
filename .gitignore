@@ -1,1 +1,9 @@
 .idea/
+# build artifact
+/dr
+
+# resume sidecars
+*.dr.json
+
+# workflow orchestration scratch
+.claude/wf-*.js

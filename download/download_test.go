@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -263,10 +264,16 @@ func TestRunSizeMismatch(t *testing.T) {
 
 	err := Run(context.Background(), opts)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrSizeMismatch), "got %v", err)
+	// The server promises a range that extends past the bytes it actually
+	// delivers, so each affected chunk surfaces a retryable short read (per-chunk
+	// truncation detection) and, after exhausting retries, the download fails as a
+	// chunk failure wrapping io.ErrUnexpectedEOF. Either way the under-delivery is
+	// never reported as success and the sidecar is retained.
+	assert.True(t, errors.Is(err, ErrChunkFailed), "got %v", err)
+	assert.True(t, errors.Is(err, io.ErrUnexpectedEOF), "got %v", err)
 
 	_, statErr := os.Stat(statePath(out))
-	assert.NoError(t, statErr, "sidecar retained on size mismatch")
+	assert.NoError(t, statErr, "sidecar retained on under-delivery")
 }
 
 func TestRunChecksumMismatch(t *testing.T) {
