@@ -7,3 +7,6 @@
 
 # workflow orchestration scratch
 .claude/wf-*.js
+
+# release artifacts
+/dist/
