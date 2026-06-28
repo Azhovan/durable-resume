@@ -1,7 +1,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +16,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const validChecksumHex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// stubRunFunc swaps the package-level runFunc for the duration of the test,
+// restoring it afterward. The provided fn receives each invocation's Options.
+func stubRunFunc(t *testing.T, fn func(ctx context.Context, opts download.Options) error) {
+	t.Helper()
+	orig := runFunc
+	t.Cleanup(func() { runFunc = orig })
+	runFunc = fn
+}
 
 func TestValidateURL(t *testing.T) {
 	t.Parallel()
@@ -154,14 +170,16 @@ func TestNewRootCmdVersion(t *testing.T) {
 func TestNewRootCmdArgsValidation(t *testing.T) {
 	t.Parallel()
 
+	// With cobra.ArbitraryArgs the Args stage no longer rejects any count; URL
+	// count semantics (zero => error, batch => continue-on-error) moved to RunE
+	// and are exercised by the TestRunE_* tests below.
 	tests := []struct {
-		name    string
-		args    []string
-		wantErr bool
+		name string
+		args []string
 	}{
-		{name: "zero args", args: []string{}, wantErr: true},
-		{name: "two args", args: []string{"http://a/x", "http://b/y"}, wantErr: true},
-		{name: "one arg", args: []string{"http://a/x"}, wantErr: false},
+		{name: "zero args", args: []string{}},
+		{name: "two args", args: []string{"http://a/x", "http://b/y"}},
+		{name: "one arg", args: []string{"http://a/x"}},
 	}
 
 	for _, tt := range tests {
@@ -169,12 +187,7 @@ func TestNewRootCmdArgsValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			cmd := NewRootCmd("v", "r", "d")
-			err := cmd.Args(cmd, tt.args)
-			if tt.wantErr {
-				require.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
+			require.NoError(t, cmd.Args(cmd, tt.args))
 		})
 	}
 }
@@ -262,6 +275,439 @@ func TestRunEWiresForceIntoOptions(t *testing.T) {
 
 			require.True(t, called, "runFunc must be invoked by RunE")
 			assert.Equal(t, tt.wantForce, captured.Force)
+		})
+	}
+}
+
+func TestReadURLsFromFile(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{name: "empty", input: "", want: nil},
+		{name: "single", input: "http://a\n", want: []string{"http://a"}},
+		{name: "no trailing newline", input: "http://a", want: []string{"http://a"}},
+		{
+			name:  "trims spaces",
+			input: "  http://a  \n\thttp://b\t\n",
+			want:  []string{"http://a", "http://b"},
+		},
+		{
+			name:  "skips blank and comment lines",
+			input: "http://a\n\n   \n# a comment\n   # indented comment\nhttp://b\n",
+			want:  []string{"http://a", "http://b"},
+		},
+		{
+			name:  "crlf and order",
+			input: "   http://a   \r\n# c\n\nhttp://b\n",
+			want:  []string{"http://a", "http://b"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := readURLsFromFile(strings.NewReader(tt.input))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestAssembleURLs_StdinDash(t *testing.T) {
+	t.Parallel()
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetIn(strings.NewReader("http://b\nhttp://c\n"))
+	got, err := assembleURLs(cmd, []string{"http://a"}, "-")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"http://a", "http://b", "http://c"}, got)
+}
+
+func TestAssembleURLs_File(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "urls.txt")
+	require.NoError(t, os.WriteFile(path, []byte("http://b\n# comment\nhttp://c\n"), 0o600))
+
+	cmd := NewRootCmd("v", "r", "d")
+	got, err := assembleURLs(cmd, []string{"http://a"}, path)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"http://a", "http://b", "http://c"}, got)
+}
+
+func TestAssembleURLs_OpenError(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cmd := NewRootCmd("v", "r", "d")
+	_, err := assembleURLs(cmd, []string{"http://a"}, filepath.Join(dir, "nope.txt"))
+	require.Error(t, err)
+}
+
+func TestRunE_SingleURL_Unchanged(t *testing.T) {
+	var captured download.Options
+	var calls int
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		calls++
+		captured = opts
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	var errBuf bytes.Buffer
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"http://example.com/file.bin", "-o", "/tmp/out.bin"})
+	require.NoError(t, cmd.Execute())
+
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "http://example.com/file.bin", captured.URL)
+	assert.Equal(t, "/tmp/out.bin", captured.Output)
+	assert.Empty(t, errBuf.String())
+}
+
+func TestRunE_SingleInvalidURL(t *testing.T) {
+	var calls int
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		calls++
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetArgs([]string{"ftp://x/file.bin"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, download.ErrUnsupportedScheme)
+	assert.Equal(t, 0, calls)
+}
+
+func TestRunE_SingleRunError(t *testing.T) {
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		return download.ErrChecksumMismatch
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	var errBuf bytes.Buffer
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"http://example.com/file.bin"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, download.ErrChecksumMismatch)
+	assert.Empty(t, errBuf.String())
+}
+
+func TestRunE_SingleChecksumPassthrough(t *testing.T) {
+	var captured download.Options
+	var calls int
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		calls++
+		captured = opts
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	var errBuf bytes.Buffer
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"http://example.com/file.bin", "--checksum", "sha256:" + validChecksumHex})
+	require.NoError(t, cmd.Execute())
+
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "sha256", captured.Checksum.Algo)
+	assert.Empty(t, errBuf.String())
+}
+
+func TestRunE_MultiPositional_Order(t *testing.T) {
+	dir := t.TempDir()
+	var capturedURLs []string
+	var capturedOutputs []string
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		capturedURLs = append(capturedURLs, opts.URL)
+		capturedOutputs = append(capturedOutputs, opts.Output)
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "http://c/z", "-o", dir})
+	require.NoError(t, cmd.Execute())
+
+	assert.Equal(t, []string{"http://a/x", "http://b/y", "http://c/z"}, capturedURLs)
+	for _, out := range capturedOutputs {
+		assert.Equal(t, dir, out)
+	}
+}
+
+func TestRunE_InputFileAppended(t *testing.T) {
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "urls.txt")
+	require.NoError(t, os.WriteFile(listPath, []byte("http://b/y\nhttp://c/z\n"), 0o600))
+	outDir := t.TempDir()
+
+	var capturedURLs []string
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		capturedURLs = append(capturedURLs, opts.URL)
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://a/x", "-i", listPath, "-o", outDir})
+	require.NoError(t, cmd.Execute())
+
+	assert.Equal(t, []string{"http://a/x", "http://b/y", "http://c/z"}, capturedURLs)
+}
+
+func TestRunE_ZeroURLs(t *testing.T) {
+	var calls int
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		calls++
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetArgs([]string{})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, download.ErrNoURL)
+	assert.Equal(t, 0, calls)
+}
+
+func TestRunE_MultiOutputRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "regular.bin")
+	require.NoError(t, os.WriteFile(filePath, []byte("x"), 0o600))
+
+	var calls int
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		calls++
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "-o", filePath})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a directory")
+	assert.Equal(t, 0, calls)
+}
+
+func TestRunE_MultiOutputDir(t *testing.T) {
+	dir := t.TempDir()
+	var capturedOutputs []string
+	var calls int
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		calls++
+		capturedOutputs = append(capturedOutputs, opts.Output)
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "-o", dir})
+	require.NoError(t, cmd.Execute())
+
+	assert.Equal(t, 2, calls)
+	for _, out := range capturedOutputs {
+		assert.Equal(t, dir, out)
+	}
+}
+
+func TestRunE_ChecksumMultiRejected(t *testing.T) {
+	var calls int
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		calls++
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "--checksum", "sha256:" + validChecksumHex})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checksum")
+	assert.Equal(t, 0, calls)
+}
+
+func TestRunE_ContinueOnError(t *testing.T) {
+	dir := t.TempDir()
+	var capturedURLs []string
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		capturedURLs = append(capturedURLs, opts.URL)
+		if opts.URL == "http://b/y" {
+			return assert.AnError
+		}
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	var errBuf bytes.Buffer
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "http://c/z", "-o", dir})
+	err := cmd.Execute()
+	require.Error(t, err)
+
+	assert.Equal(t, []string{"http://a/x", "http://b/y", "http://c/z"}, capturedURLs)
+	assert.Contains(t, errBuf.String(), "dr: 2 of 3 downloads succeeded")
+	assert.Contains(t, errBuf.String(), "dr: http://b/y:")
+}
+
+func TestRunE_AllSuccess(t *testing.T) {
+	dir := t.TempDir()
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	var errBuf bytes.Buffer
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "http://c/z", "-o", dir})
+	require.NoError(t, cmd.Execute())
+
+	assert.Contains(t, errBuf.String(), "dr: 3 of 3 downloads succeeded")
+	assert.NotContains(t, errBuf.String(), "dr: http://")
+}
+
+func TestRunE_CancelMidBatch(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls int
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		calls++
+		cancel() // cancel at the end of the first invocation
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetContext(ctx)
+	var errBuf bytes.Buffer
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "http://c/z", "-o", dir})
+	err := cmd.Execute()
+	require.Error(t, err)
+
+	assert.Equal(t, 1, calls, "later URLs must not be launched after cancellation")
+	assert.Contains(t, errBuf.String(), "dr: 1 of 3 downloads succeeded")
+	// The two not-attempted URLs must be reported as per-URL failures with a
+	// context-cancellation error (guards against recording them with a nil error,
+	// which would miscount them as successes).
+	assert.Contains(t, errBuf.String(), "dr: http://b/y:")
+	assert.Contains(t, errBuf.String(), "dr: http://c/z:")
+	assert.Contains(t, errBuf.String(), context.Canceled.Error())
+}
+
+func TestNewRootCmdInputFileFlag(t *testing.T) {
+	t.Parallel()
+	cmd := NewRootCmd("v", "r", "d")
+	f := cmd.Flags().Lookup("input-file")
+	require.NotNil(t, f, "input-file flag should be registered")
+	assert.Equal(t, "i", f.Shorthand)
+	assert.Equal(t, "", f.DefValue)
+}
+
+// TestRunE_BatchEndToEnd exercises the batch path against a real httptest server
+// using the default runFunc (download.Run), confirming two files land in the
+// output directory and per-file "saved to" lines are emitted. Deterministic and
+// race-clean: no real network, no sleeps.
+func TestRunE_BatchEndToEnd(t *testing.T) {
+	const (
+		bodyA = "alpha contents"
+		bodyB = "beta contents"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/a.txt":
+			w.Header().Set("Content-Length", "14")
+			_, _ = w.Write([]byte(bodyA))
+		case "/b.txt":
+			_, _ = w.Write([]byte(bodyB))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cmd := NewRootCmd("v", "r", "d")
+	var outBuf, errBuf bytes.Buffer
+	cmd.SetOut(&outBuf)
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{srv.URL + "/a.txt", srv.URL + "/b.txt", "-o", dir, "-q"})
+	require.NoError(t, cmd.Execute())
+
+	gotA, err := os.ReadFile(filepath.Join(dir, "a.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, bodyA, string(gotA))
+	gotB, err := os.ReadFile(filepath.Join(dir, "b.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, bodyB, string(gotB))
+
+	assert.Contains(t, errBuf.String(), "dr: 2 of 2 downloads succeeded")
+}
+
+// TestRunE_BatchInvalidURLContinues confirms requirement 6 at the RunE/batch
+// boundary: an invalid URL among valid ones is a per-URL failure (counted,
+// reported) while the valid URLs are still attempted. Guards against regressions
+// that either fail-fast the whole batch on the first bad URL or skip per-URL
+// validation (passing ftp:// straight to runFunc).
+func TestRunE_BatchInvalidURLContinues(t *testing.T) {
+	var capturedURLs []string
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		capturedURLs = append(capturedURLs, opts.URL)
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	var errBuf bytes.Buffer
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"http://a/x", "ftp://bad", "http://c/z", "-o", t.TempDir()})
+	err := cmd.Execute()
+	require.Error(t, err)
+
+	// Only the valid URLs reach runFunc; ftp://bad is never downloaded.
+	assert.Equal(t, []string{"http://a/x", "http://c/z"}, capturedURLs)
+	assert.Contains(t, errBuf.String(), "dr: 2 of 3 downloads succeeded")
+	assert.Contains(t, errBuf.String(), "dr: ftp://bad:")
+	assert.Contains(t, errBuf.String(), download.ErrUnsupportedScheme.Error())
+}
+
+// TestRunE_BadHeaderFailsFast confirms requirement 6's global fail-fast: a
+// malformed -H header (or bad --checksum syntax) aborts before assembleURLs and
+// the batch loop, so runFunc is never invoked even with multiple URLs.
+func TestRunE_BadHeaderFailsFast(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "bad header",
+			args: []string{"http://a/x", "http://b/y", "-H", "bogus"},
+		},
+		{
+			name: "bad checksum syntax",
+			args: []string{"http://a/x", "http://b/y", "--checksum", "sha256:nothex"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int
+			stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+				calls++
+				return nil
+			})
+
+			cmd := NewRootCmd("v", "r", "d")
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs(tt.args)
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Equal(t, 0, calls, "no download must be attempted on a parse error")
 		})
 	}
 }
