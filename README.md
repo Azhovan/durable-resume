@@ -37,6 +37,9 @@ dr https://example.com/largefile.iso -c 8
 # Disable resume (start fresh, ignore any sidecar)
 dr https://example.com/file.zip --resume=false
 
+# Re-download even if the file already exists and is complete
+dr https://example.com/file.zip --force
+
 # Verify integrity with sha256
 dr https://example.com/file.zip --checksum sha256:<hex>
 
@@ -58,6 +61,7 @@ Usage: dr <url> [flags]
   -o, --output string        destination file or directory (default: Content-Disposition or URL name)
   -c, --concurrency int      number of parallel chunks (default 4)
       --resume               resume a previous interrupted download (default true)
+  -f, --force                re-download even if the destination already exists
       --checksum string      verify with "sha256:<hex>"
       --timeout duration     per-request HTTP timeout (0 = none) (default 30s)
       --retries int          per-chunk retry attempts (default 3)
@@ -113,6 +117,15 @@ same-directory `os.Rename`). So the final path either does not exist yet or is a
 complete, verified file — an observer never sees a half-written or zero-holed
 file at the real name. On interruption or failure the `.part` is kept and the
 final path is left untouched.
+
+## Skipping completed downloads
+
+Re-running `dr` on a destination that already exists and is verifiably complete
+returns immediately without fetching the body. "Complete" means: the `--checksum`
+matches if one was given, otherwise the on-disk size equals the size the server
+reports. If completeness cannot be proven (unknown size and no checksum), or the
+existing file does not match, `dr` downloads normally. Pass `--force` (`-f`) to
+always re-download.
 
 ## How Resume Works
 
