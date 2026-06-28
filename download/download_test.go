@@ -89,8 +89,10 @@ func TestRunRangedEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
 
-	// Sidecar removed on success.
-	_, statErr := os.Stat(statePath(out))
+	// .part staging file and sidecar removed on success (renamed onto the final path).
+	_, statErr := os.Stat(partPath(out))
+	assert.True(t, os.IsNotExist(statErr), ".part should be renamed away on success")
+	_, statErr = os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr), "sidecar should be removed on success")
 }
 
@@ -278,9 +280,12 @@ func TestRunNoRangeSingleStream(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
 
-	// No sidecar should ever be created on the single-stream path.
-	_, statErr := os.Stat(statePath(out))
+	// No sidecar should ever be created on the single-stream path, and the .part
+	// must be renamed away on success.
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr), "single-stream must not create a sidecar")
+	_, statErr = os.Stat(partPath(out))
+	assert.True(t, os.IsNotExist(statErr), ".part should be renamed away on success")
 }
 
 func TestRunResume(t *testing.T) {
@@ -313,11 +318,12 @@ func TestRunResume(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "file.bin")
 
-	// Pre-seed: single chunk covering the whole file, half already done.
+	// Pre-seed the .part staging file: single chunk covering the whole file, half
+	// already done.
 	half := int64(len(payload) / 2)
-	require.NoError(t, os.WriteFile(out, payload[:half], 0o644))
-	// Pad the file out to full size so resume opens (no truncate) over real bytes.
-	f, err := os.OpenFile(out, os.O_WRONLY, 0o644)
+	require.NoError(t, os.WriteFile(partPath(out), payload[:half], 0o644))
+	// Pad the .part out to full size so resume opens (no truncate) over real bytes.
+	f, err := os.OpenFile(partPath(out), os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	require.NoError(t, f.Truncate(int64(len(payload))))
 	require.NoError(t, f.Close())
@@ -331,7 +337,7 @@ func TestRunResume(t *testing.T) {
 			{Index: 0, Start: 0, End: int64(len(payload)) - 1, Done: half},
 		},
 	}
-	require.NoError(t, st.Save(statePath(out)))
+	require.NoError(t, st.Save(statePath(partPath(out))))
 
 	opts := baseOpts(t, srv.URL, out)
 	opts.Client = srv.Client()
@@ -345,7 +351,9 @@ func TestRunResume(t *testing.T) {
 	assert.Equal(t, payload, got)
 	assert.GreaterOrEqual(t, atomic.LoadInt32(&rangeRequested), int32(1), "remainder served via Range from a non-zero offset")
 
-	_, statErr := os.Stat(statePath(out))
+	_, statErr := os.Stat(partPath(out))
+	assert.True(t, os.IsNotExist(statErr), ".part renamed away on resume success")
+	_, statErr = os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr), "sidecar removed on resume success")
 }
 
@@ -357,7 +365,7 @@ func TestRunResumeRemoteChanged(t *testing.T) {
 
 	dir := t.TempDir()
 	out := filepath.Join(dir, "file.bin")
-	require.NoError(t, os.WriteFile(out, payload[:100], 0o644))
+	require.NoError(t, os.WriteFile(partPath(out), payload[:100], 0o644))
 
 	st := &State{
 		URL:         srv.URL,
@@ -368,7 +376,7 @@ func TestRunResumeRemoteChanged(t *testing.T) {
 			{Index: 0, Start: 0, End: int64(len(payload)) - 1, Done: 100},
 		},
 	}
-	require.NoError(t, st.Save(statePath(out)))
+	require.NoError(t, st.Save(statePath(partPath(out))))
 
 	opts := baseOpts(t, srv.URL, out)
 	opts.Client = srv.Client()
@@ -377,9 +385,11 @@ func TestRunResumeRemoteChanged(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrRemoteChanged), "got %v", err)
 
-	// Sidecar retained.
-	_, statErr := os.Stat(statePath(out))
+	// Sidecar retained; final path never created.
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.NoError(t, statErr, "sidecar retained when remote changed")
+	_, statErr = os.Stat(out)
+	assert.True(t, os.IsNotExist(statErr), "final path must not be created on failure")
 }
 
 func TestRunSizeMismatch(t *testing.T) {
@@ -433,8 +443,10 @@ func TestRunSizeMismatch(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrChunkFailed), "got %v", err)
 	assert.True(t, errors.Is(err, io.ErrUnexpectedEOF), "got %v", err)
 
-	_, statErr := os.Stat(statePath(out))
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.NoError(t, statErr, "sidecar retained on under-delivery")
+	_, statErr = os.Stat(out)
+	assert.True(t, os.IsNotExist(statErr), "final path must not be created on failure")
 }
 
 func TestRunChecksumMismatch(t *testing.T) {
@@ -453,8 +465,10 @@ func TestRunChecksumMismatch(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrChecksumMismatch), "got %v", err)
 
-	_, statErr := os.Stat(statePath(out))
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.NoError(t, statErr, "sidecar retained on checksum mismatch")
+	_, statErr = os.Stat(out)
+	assert.True(t, os.IsNotExist(statErr), "final path must not be created on failure")
 }
 
 func TestRunChecksumMatch(t *testing.T) {
@@ -472,7 +486,7 @@ func TestRunChecksumMatch(t *testing.T) {
 	err := Run(context.Background(), opts)
 	require.NoError(t, err)
 
-	_, statErr := os.Stat(statePath(out))
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr))
 }
 
@@ -531,11 +545,13 @@ func TestRunContextCancelPreservesPartialAndSidecar(t *testing.T) {
 	err := Run(ctx, opts)
 	require.Error(t, err)
 
-	// Partial file retained.
-	_, statErr := os.Stat(out)
-	assert.NoError(t, statErr, "partial file retained on cancel")
+	// Partial .part retained; nothing at the final path.
+	_, statErr := os.Stat(partPath(out))
+	assert.NoError(t, statErr, ".part retained on cancel")
+	_, statErr = os.Stat(out)
+	assert.True(t, os.IsNotExist(statErr), "final path must not be created on cancel")
 	// Sidecar retained (state flushed on exit).
-	data, sideErr := os.ReadFile(statePath(out))
+	data, sideErr := os.ReadFile(statePath(partPath(out)))
 	require.NoError(t, sideErr, "sidecar retained on cancel")
 	var saved State
 	require.NoError(t, json.Unmarshal(data, &saved))

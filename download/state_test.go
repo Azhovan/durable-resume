@@ -14,6 +14,10 @@ import (
 func TestStatePath(t *testing.T) {
 	assert.Equal(t, "out.bin.dr.json", statePath("out.bin"))
 	assert.Equal(t, "/tmp/x.dr.json", statePath("/tmp/x"))
+
+	// The staging path and the sidecar that travels with it.
+	assert.Equal(t, "out.bin.part", partPath("out.bin"))
+	assert.Equal(t, "out.bin.part.dr.json", statePath(partPath("out.bin")))
 }
 
 func TestSaveLoadRoundTrip(t *testing.T) {

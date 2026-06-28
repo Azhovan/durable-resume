@@ -6,6 +6,15 @@
 // destination file via os.File.WriteAt, then verify size and optional checksum.
 // On success the resume sidecar is removed; on failure or interruption the
 // sidecar and partial file are retained so a later run can resume.
+//
+// All bytes are staged into a sibling "<output>.part" file (see partPath); the
+// segmented resume sidecar travels with it as "<output>.part.dr.json". The final
+// path opts.Output is touched exactly once, by an atomic same-directory
+// os.Rename(part, output) performed only after the bytes are fully written and
+// both size and checksum verification pass. The final path therefore never holds
+// a partial, zero-holed, or unverified file: it goes from absent straight to a
+// complete, verified file in one step. On failure/interruption the .part (and
+// its sidecar) remain so a later run resumes.
 package download
 
 import (
@@ -134,7 +143,13 @@ func savedf(opts Options) {
 // into the destination with no resume state and no size verification when the
 // size is unknown.
 func runSingleStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo) error {
-	dst, err := os.OpenFile(opts.Output, os.O_CREATE|os.O_WRONLY, 0o644)
+	// Stage into <output>.part; rename onto the final path only after verification.
+	// runSingle truncates dst to 0 on every attempt, so any pre-existing (stale)
+	// .part is overwritten; opts.Output is never touched before the atomic rename.
+	part := partPath(opts.Output)
+	vlogf(opts, "staging: writing to %q", part)
+
+	dst, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("download: open destination: %w", err)
 	}
@@ -173,8 +188,14 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 		return fmt.Errorf("download: close destination: %w", err)
 	}
 	dst = nil // prevent the deferred close from running on an already-closed file
-	if err := verifyChecksum(opts.Output, opts.Checksum); err != nil {
+	if err := verifyChecksum(part, opts.Checksum); err != nil {
 		return err
+	}
+
+	// SUCCESS: atomic same-directory rename .part -> final. The only touch of
+	// opts.Output; on POSIX it overwrites any pre-existing file in one step.
+	if err := os.Rename(part, opts.Output); err != nil {
+		return fmt.Errorf("download: finalize output: %w", err)
 	}
 	return nil
 }
@@ -183,7 +204,12 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 // state), pre-allocate or reopen the destination, run the bounded worker pool,
 // then verify and clean up.
 func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options, info remoteInfo, concurrency int) error {
-	sp := statePath(opts.Output)
+	// Stage into <output>.part; the sidecar travels with it at statePath(part) ==
+	// <output>.part.dr.json. On success: verify, close, rename .part -> final, THEN
+	// remove the sidecar (order matters; see the rename-failure handling below).
+	part := partPath(opts.Output)
+	sp := statePath(part)
+	vlogf(opts, "staging: writing to %q (sidecar %q)", part, sp)
 
 	var st *State
 	var chunks []chunk
@@ -210,8 +236,8 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 				// No usable validator: discard and start fresh.
 				vlogf(opts, "resume: sidecar has no usable validator; discarding and starting fresh")
 				saved = nil
-			case !partialFileUsable(opts.Output, saved.Size):
-				// The sidecar survived but the on-disk data file is missing or no
+			case !partialFileUsable(part, saved.Size):
+				// The sidecar survived but the on-disk .part file is missing or no
 				// longer matches the pre-allocated size. Trusting the per-chunk
 				// done cursors now would skip already-"done" chunks and deliver a
 				// sparse, zero-holed file as a success. Discard and start fresh.
@@ -232,9 +258,12 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 		st = newState(opts.URL, info, concurrency, chunks)
 	}
 
-	// 4. open destination: truncate to pre-allocate on fresh; no truncation on
-	// resume (the on-disk size was validated above before honoring the cursors).
-	dst, err := os.OpenFile(opts.Output, os.O_CREATE|os.O_WRONLY, 0o644)
+	// 4. open the .part destination: FRESH => Truncate(info.size) pre-allocates AND
+	// overwrites any stale .part left by a prior failed run (treated as discardable,
+	// matching the previous in-place fresh-Truncate behavior; never an error).
+	// RESUME => no truncation (the on-disk size was validated above before honoring
+	// the per-chunk cursors).
+	dst, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("download: open destination: %w", err)
 	}
@@ -288,10 +317,22 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 		return fmt.Errorf("download: close destination: %w", err)
 	}
 	dst = nil // prevent the deferred close from running on an already-closed file
-	if err := verifyChecksum(opts.Output, opts.Checksum); err != nil {
+	if err := verifyChecksum(part, opts.Checksum); err != nil {
 		return err
 	}
 
+	// SUCCESS: atomic rename FIRST, then drop the sidecar. If the rename fails,
+	// return wrapped and KEEP the sidecar so the next run can retry/resume. (On
+	// POSIX the same-directory rename atomically overwrites any pre-existing final
+	// file. On Windows os.Rename fails if the target exists; a future port would
+	// need an os.ReplaceFile / remove-then-rename shim — out of scope here.)
+	//
+	// A crash between the rename and the Remove leaves an orphan sidecar with no
+	// .part; the next run's LoadState -> partialFileUsable(part) then fails and it
+	// starts fresh, removing the orphan on the next success. Harmless.
+	if err := os.Rename(part, opts.Output); err != nil {
+		return fmt.Errorf("download: finalize output: %w", err)
+	}
 	if err := st.Remove(sp); err != nil {
 		return err
 	}
@@ -312,18 +353,30 @@ func validateScheme(rawURL string) error {
 	}
 }
 
-// partialFileUsable reports whether the existing destination file is consistent
+// partPath returns the staging path for an in-progress download: output + ".part".
+// All bytes are written here; the segmented resume sidecar travels with it as
+// statePath(partPath(output)) == output + ".part.dr.json". partialFileUsable,
+// verifySize, and verifyChecksum all key off this path. On success the .part is
+// atomically renamed onto opts.Output via a single same-directory os.Rename, so
+// the final path is never observed holding a partial or zero-holed file. A stale
+// .part left by a prior failed run is overwritten on a fresh start (Truncate),
+// matching the previous in-place fresh-Truncate behavior — never an error.
+func partPath(output string) string {
+	return output + ".part"
+}
+
+// partialFileUsable reports whether the existing .part staging file is consistent
 // with a sidecar whose chunk done-cursors will be trusted on resume. The fresh
-// run pre-allocates the file with Truncate(size), so a resumable partial file
+// run pre-allocates the .part with Truncate(size), so a resumable partial file
 // must still exist with exactly that on-disk size. A missing, truncated, or
 // otherwise resized file means the cursors can no longer be trusted (resuming
 // would skip "done" chunks and leave zero holes), so the caller must restart.
-func partialFileUsable(output string, size int64) bool {
+func partialFileUsable(part string, size int64) bool {
 	if size <= 0 {
 		// Unknown/zero size is never the segmented (pre-allocated) path.
 		return false
 	}
-	fi, err := os.Stat(output)
+	fi, err := os.Stat(part)
 	if err != nil {
 		return false
 	}

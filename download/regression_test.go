@@ -44,9 +44,9 @@ func TestRunResumeMissingFileRestartsFresh(t *testing.T) {
 			{Index: 0, Start: 0, End: int64(len(payload)) - 1, Done: half},
 		},
 	}
-	require.NoError(t, st.Save(statePath(out)))
-	// Ensure the data file is absent.
-	_, statErr := os.Stat(out)
+	require.NoError(t, st.Save(statePath(partPath(out))))
+	// Ensure the .part data file is absent.
+	_, statErr := os.Stat(partPath(out))
 	require.True(t, os.IsNotExist(statErr))
 
 	opts := baseOpts(t, srv.URL, out)
@@ -60,7 +60,7 @@ func TestRunResumeMissingFileRestartsFresh(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, got, "missing partial file must trigger a fresh re-download, not a sparse file")
 
-	_, statErr = os.Stat(statePath(out))
+	_, statErr = os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr), "sidecar removed on success")
 }
 
@@ -77,8 +77,8 @@ func TestRunResumeTruncatedFileRestartsFresh(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "file.bin")
 
-	// Write a truncated (too short) data file that disagrees with the sidecar.
-	require.NoError(t, os.WriteFile(out, payload[:1000], 0o644))
+	// Write a truncated (too short) .part data file that disagrees with the sidecar.
+	require.NoError(t, os.WriteFile(partPath(out), payload[:1000], 0o644))
 
 	st := &State{
 		URL:         srv.URL,
@@ -89,7 +89,7 @@ func TestRunResumeTruncatedFileRestartsFresh(t *testing.T) {
 			{Index: 0, Start: 0, End: int64(len(payload)) - 1, Done: int64(len(payload) / 2)},
 		},
 	}
-	require.NoError(t, st.Save(statePath(out)))
+	require.NoError(t, st.Save(statePath(partPath(out))))
 
 	opts := baseOpts(t, srv.URL, out)
 	opts.Client = srv.Client()
@@ -176,11 +176,13 @@ func TestRunInterruptThenResumeRoundTrip(t *testing.T) {
 	err := Run(ctx, opts)
 	require.Error(t, err, "interrupted run should fail")
 
-	// Sidecar retained, partial file retained.
-	_, statErr := os.Stat(statePath(out))
+	// Sidecar retained, .part retained, nothing at the final path.
+	_, statErr := os.Stat(statePath(partPath(out)))
 	require.NoError(t, statErr, "real sidecar must be retained after interrupt")
+	_, statErr = os.Stat(partPath(out))
+	require.NoError(t, statErr, ".part must be retained after interrupt")
 	_, statErr = os.Stat(out)
-	require.NoError(t, statErr, "partial file must be retained after interrupt")
+	require.True(t, os.IsNotExist(statErr), "final path must not exist after interrupt")
 
 	// Second run: fresh context, same server+output. Must resume and complete.
 	opts2 := baseOpts(t, srv.URL, out)
@@ -195,7 +197,9 @@ func TestRunInterruptThenResumeRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, got, "resumed download must equal full payload")
 
-	_, statErr = os.Stat(statePath(out))
+	_, statErr = os.Stat(partPath(out))
+	assert.True(t, os.IsNotExist(statErr), ".part renamed away on resume success")
+	_, statErr = os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr), "sidecar removed on resume success")
 	assert.Greater(t, nonZeroRangeAfterResume.Load(), int32(0),
 		"second run must issue Range requests from non-zero offsets (proving resume, not restart)")
@@ -213,7 +217,7 @@ func TestRunResumeSizeChangedNoValidator(t *testing.T) {
 
 	dir := t.TempDir()
 	out := filepath.Join(dir, "file.bin")
-	require.NoError(t, os.WriteFile(out, payload[:100], 0o644))
+	require.NoError(t, os.WriteFile(partPath(out), payload[:100], 0o644))
 
 	st := &State{
 		URL:         srv.URL,
@@ -223,7 +227,7 @@ func TestRunResumeSizeChangedNoValidator(t *testing.T) {
 			{Index: 0, Start: 0, End: int64(len(payload)) + 998, Done: 100},
 		},
 	}
-	require.NoError(t, st.Save(statePath(out)))
+	require.NoError(t, st.Save(statePath(partPath(out))))
 
 	opts := baseOpts(t, srv.URL, out)
 	opts.Client = srv.Client()
@@ -233,8 +237,10 @@ func TestRunResumeSizeChangedNoValidator(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrRemoteChanged), "got %v", err)
 	assert.Contains(t, err.Error(), "size", "should report a size change, not an etag change")
 
-	_, statErr := os.Stat(statePath(out))
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.NoError(t, statErr, "sidecar retained when remote size changed")
+	_, statErr = os.Stat(out)
+	assert.True(t, os.IsNotExist(statErr), "final path must not be created on failure")
 }
 
 // TestRunResumeNoValidatorMatchingSizeRestartsFresh covers download.go branch
@@ -248,8 +254,8 @@ func TestRunResumeNoValidatorMatchingSizeRestartsFresh(t *testing.T) {
 
 	dir := t.TempDir()
 	out := filepath.Join(dir, "file.bin")
-	// A partial file at full size so the (unused) on-disk guard wouldn't interfere.
-	require.NoError(t, os.WriteFile(out, make([]byte, len(payload)), 0o644))
+	// A partial .part at full size so the (unused) on-disk guard wouldn't interfere.
+	require.NoError(t, os.WriteFile(partPath(out), make([]byte, len(payload)), 0o644))
 
 	st := &State{
 		URL:         srv.URL,
@@ -259,7 +265,7 @@ func TestRunResumeNoValidatorMatchingSizeRestartsFresh(t *testing.T) {
 			{Index: 0, Start: 0, End: int64(len(payload)) - 1, Done: 500},
 		},
 	}
-	require.NoError(t, st.Save(statePath(out)))
+	require.NoError(t, st.Save(statePath(partPath(out))))
 
 	opts := baseOpts(t, srv.URL, out)
 	opts.Client = srv.Client()
@@ -272,7 +278,7 @@ func TestRunResumeNoValidatorMatchingSizeRestartsFresh(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, got, "no-validator sidecar must be discarded and re-downloaded fresh")
 
-	_, statErr := os.Stat(statePath(out))
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr), "sidecar removed on success")
 }
 
@@ -446,7 +452,7 @@ func TestRunSingleStreamNoLength(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
 
-	_, statErr := os.Stat(statePath(out))
+	_, statErr := os.Stat(statePath(partPath(out)))
 	assert.True(t, os.IsNotExist(statErr), "single-stream must not create a sidecar")
 }
 
