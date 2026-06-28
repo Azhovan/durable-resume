@@ -1,15 +1,15 @@
 # Durable Resume
 
-A fast, reliable file downloader with automatic resume capability, parallel segmented downloading, and intelligent error handling.
+A reliable file downloader with durable resume, parallel segmented downloading, and optional integrity verification.
 
 ## Key Features
 
 - **Simple CLI**: Just `dr <URL>` - no subcommands required
-- **Fast Downloads**: Parallel chunks with true durable resume
-- **Real-Time Progress**: Live progress with speed and ETA (TTY only)
-- **Smart Error Handling**: Clear, actionable error messages
-- **Flexible**: HTTP/HTTPS, custom output paths, custom headers, and quiet mode for scripting
+- **Segmented downloads**: Parallel byte-range chunks written into a single pre-allocated file
+- **Durable resume**: Per-chunk progress is persisted to a sidecar and resumed via HTTP Range
+- **Live progress**: Speed, transferred/total, and ETA, rendered only on a TTY
 - **Integrity**: Final size check plus optional sha256 verification
+- **Flexible**: HTTP/HTTPS, custom output paths, custom headers, and a quiet mode for scripting
 
 ## Installation
 
@@ -28,7 +28,7 @@ dr https://example.com/file.zip
 # Download to a specific path
 dr https://example.com/file.zip -o myfile.zip
 
-# Faster download with more parallel chunks
+# More parallel chunks
 dr https://example.com/largefile.iso -c 8
 
 # Disable resume (start fresh, ignore any sidecar)
@@ -52,59 +52,107 @@ dr https://example.com/file.tar.gz --verbose
 ```
 Usage: dr <url> [flags]
 
-  -o, --output string        Destination path (default: derived from URL)
-  -c, --concurrency int      Number of parallel chunks (default: 4)
-      --resume               Resume a previous interrupted download (default: true; use --resume=false to disable)
-      --checksum string      Verify with "sha256:<hex>"
-      --timeout duration     Per-request HTTP timeout (0 = none) (default: 30s)
-      --retries int          Per-chunk retry attempts (default: 3)
-  -H, --header stringArray   Extra request header "Key: Value" (repeatable)
-  -q, --quiet                Suppress progress output
-  -v, --verbose              Extra logging
+  -o, --output string        destination path (default: derived from URL)
+  -c, --concurrency int      number of parallel chunks (default 4)
+      --resume               resume a previous interrupted download (default true)
+      --checksum string      verify with "sha256:<hex>"
+      --timeout duration     per-request HTTP timeout (0 = none) (default 30s)
+      --retries int          per-chunk retry attempts (default 3)
+  -H, --header stringArray   extra request header "Key: Value" (repeatable)
+  -q, --quiet                suppress progress output
+  -v, --verbose              extra logging
+      --version              version for dr
 ```
 
-Only `http` and `https` URLs are supported.
+`--resume` defaults to `true`; pass `--resume=false` to disable it. Only `http`
+and `https` URLs are supported.
 
 ## Progress Display
 
-Real-time progress with speed, data transfer, and ETA:
+When stdout is a TTY and `--quiet` is not set, a single line is redrawn in place
+roughly five times per second. Sizes and rates use binary units (KiB, MiB, GiB).
+
+When the total size is known:
 
 ```
-[===================>    ] 78.5% 45.2 MB/s 1.2GB/2.1GB ETA: 0m23s
+ 78.50% 1.20 GiB / 2.10 GiB  45.20 MiB/s  ETA 23s
 ```
 
+When the size is unknown (no segmented plan), only transferred bytes and rate
+are shown:
 
+```
+45.30 MiB  12.00 MiB/s
+```
+
+## How Resume Works
+
+On a segmented download, `dr` writes a sidecar named `<output>.dr.json` next to
+the destination file. The sidecar records:
+
+- the per-chunk byte cursors (how many bytes of each chunk are already on disk), and
+- a remote validator: the total size plus the server's `ETag` and/or
+  `Last-Modified`.
+
+Re-running the same command reloads the sidecar and continues each unfinished
+chunk with an HTTP `Range` request, skipping bytes already written. Bytes land
+directly in the pre-allocated destination file via `WriteAt`, so no temporary
+files or merge step are involved.
+
+The sidecar is removed after a successful, fully verified download, and retained
+on interruption or failure so the next run can resume.
+
+If the remote has changed since the saved state - a different size, or a
+different `ETag`/`Last-Modified` - resuming is refused rather than silently
+producing a corrupt file. The failure surfaces as `download: ... remote changed
+since saved state; cannot resume`. Use `--resume=false` to discard the sidecar
+and start fresh.
 
 ## Error Handling
 
-Clear, actionable error messages with solutions:
+On failure, `dr` prints a single concise line to stderr and exits non-zero:
 
 ```
-❌ Error: Invalid URL format - missing protocol
-
-URL: example.com/file.zip
-
-Did you mean:
-  https://example.com/file.zip
-  http://example.com/file.zip
+dr: <error>
 ```
 
-## Contributing
+The download engine returns wrapped sentinel errors, so the message identifies
+the cause. Examples:
 
-Contributions are welcome! Please refer to our contributing guidelines.
+```
+dr: scheme "ftp": download: only http and https are supported
+dr: download: checksum mismatch
+dr: download: size 1048576 vs 2097152: download: remote changed since saved state; cannot resume
+dr: invalid checksum hex "zz": encoding/hex: invalid byte: U+007A 'z'
+```
 
-## What's New in v2.0
+## Building & Testing
 
-- **Simplified CLI**: Direct `dr <URL>` syntax (no subcommands)
-- **True Durable Resume**: Per-chunk cursors persisted to a sidecar; resumes via HTTP Range
-- **Real-Time Progress**: Live progress with speed and ETA
-- **Smart Error Messages**: Clear, actionable error reporting
+```shell
+# Build the dr binary; ldflags inject version, revision, and date
+make build
+
+# Run the test suite with the race detector
+make test
+
+# Install into $GOBIN / $GOPATH/bin
+go install github.com/azhovan/durable-resume@latest
+```
+
+`make build` stamps `main.Version`, `main.Revision`, and `main.Date` via
+`-ldflags`; the values are surfaced by `dr --version`. `make test` runs
+`go test ./... -race`.
 
 ## Roadmap
+
+The following are potential future work and are not yet implemented:
 
 - Dynamic segment adjustment based on network conditions
 - Configuration file support
 - Download queue management
 - Bandwidth limiting
-- Proxy/VPN support
+- Proxy support
 
+## Contributing
+
+Contributions are welcome. Please open an issue or pull request.
