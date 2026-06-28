@@ -15,14 +15,15 @@ URL it:
 
 - probes the remote once to learn the size and whether it honors byte ranges;
 - if ranges are honored and the size is known, splits the file into disjoint byte
-  chunks and downloads them concurrently into a single pre-allocated destination
-  file via `os.File.WriteAt`;
+  chunks and downloads them concurrently into a single pre-allocated `<output>.part`
+  staging file via `os.File.WriteAt`, then atomically renames the `.part` onto the
+  final path only after verification (so the final path never holds a partial);
 - if ranges are not honored (or the size is unknown), falls back to a single
-  sequential stream;
-- persists durable resume state in a `<output>.dr.json` sidecar so an interrupted
-  segmented download can be continued later from non-zero offsets;
+  sequential stream (still staged into `<output>.part` and atomically renamed);
+- persists durable resume state in a `<output>.part.dr.json` sidecar so an
+  interrupted segmented download can be continued later from non-zero offsets;
 - verifies the result by on-disk size and, optionally, a `sha256` checksum;
-- removes the sidecar on success and retains both sidecar and partial file on
+- removes the sidecar on success and retains both sidecar and `.part` file on
   failure/interruption.
 
 Design priorities, in order: **correctness** (never report a sparse/short file as
@@ -103,16 +104,17 @@ flowchart TD
     G -->|no| SS[runSingleStream]
     G -->|yes| SEG[runSegmentedDownload]
 
-    SS --> SS1[open dst O_CREATE\|O_WRONLY]
+    SS --> SS1[open .part O_CREATE\|O_WRONLY]
     SS1 --> SS2[retry: runSingle truncate-to-0 then sequential WriteAt from 0]
     SS2 --> SS3[verifySize skip-if-unknown + verifyChecksum]
-    SS3 --> OK[success - no sidecar]
+    SS3 --> SSR[os.Rename .part -> final]
+    SSR --> OK[success - no sidecar]
 
     SEG --> R1{opts.Resume?}
-    R1 -->|yes| R2[LoadState <output>.dr.json]
+    R1 -->|yes| R2[LoadState <output>.part.dr.json]
     R2 --> R3{saved != nil?}
     R3 -->|Matches=false| R4[size differs? ErrRemoteChanged / etag differs? ErrRemoteChanged / no validator? discard]
-    R3 -->|partial file missing or wrong size| R5[discard sidecar]
+    R3 -->|.part missing or wrong size| R5[discard sidecar]
     R3 -->|ok| R6[st=saved; chunks=toChunks; resumed=true]
     R1 -->|no| P
     R4 -->|discard| P
@@ -120,17 +122,18 @@ flowchart TD
     R6 --> OPEN
     P[planChunks + newState] --> OPEN
 
-    OPEN[open dst] --> TR{resumed?}
-    TR -->|no| TRU[dst.Truncate size - pre-allocate]
+    OPEN[open .part dst] --> TR{resumed?}
+    TR -->|no| TRU[dst.Truncate size - pre-allocate / overwrite stale .part]
     TR -->|yes| NOTRU[no truncate - on-disk size already validated]
     TRU --> POOL
     NOTRU --> POOL
 
     POOL[runSegmented: bounded worker pool<br/>fetchChunk -> WriteAt at disjoint offsets<br/>MarkProgress + periodic Save] --> DONE{dlErr?}
-    DONE -->|err| RETAIN[retain sidecar + partial file - return err]
+    DONE -->|err| RETAIN[retain .part + sidecar - return err]
     DONE -->|nil| V1[check st.completedBytes == size]
     V1 --> V2[verifySize + close dst + verifyChecksum]
-    V2 --> RM[st.Remove sidecar]
+    V2 --> SEGR[os.Rename .part -> final]
+    SEGR --> RM[st.Remove sidecar]
     RM --> OK
 ```
 
@@ -144,20 +147,27 @@ Step-by-step (`download.Run` → `runSegmentedDownload`):
    hard-fails on a streamable-but-non-206 status; only transport errors propagate.
 3. **Strategy select** — `info.streamable()` is `acceptRanges && size > 0`. If
    false → `runSingleStream`; otherwise → `runSegmentedDownload`.
-4. **Resume-state load/validate** (segmented only, when `opts.Resume`) —
-   `LoadState(statePath(output))` → see §5.
+4. **Resume-state load/validate** (segmented only, when `opts.Resume`) — the bytes
+   are staged into `part := partPath(opts.Output)` and the sidecar travels with it,
+   so the load is `LoadState(statePath(part))` (i.e. `<output>.part.dr.json`) → see §5.
 5. **Chunk plan** — fresh runs call `planChunks(info.size, concurrency)` and
    `newState(...)`; resumed runs reconstruct chunks via `saved.toChunks()`.
-6. **Open + pre-allocate** — `os.OpenFile(output, O_CREATE|O_WRONLY, 0o644)`. Fresh
-   runs `dst.Truncate(info.size)` to pre-allocate; resumed runs do **not** truncate
-   (the on-disk size was already validated).
+6. **Open + pre-allocate** — `os.OpenFile(part, O_CREATE|O_WRONLY, 0o644)` opens the
+   `<output>.part` staging file. Fresh runs `dst.Truncate(info.size)` to pre-allocate
+   (this also overwrites any stale `.part` left by a prior failed run); resumed runs
+   do **not** truncate (the on-disk size was already validated). `opts.Output` is
+   never opened or written here.
 7. **Worker pool** — `runSegmented(...)` runs the bounded pool writing via
-   `WriteAt` at disjoint offsets, flushing state periodically and finally.
+   `WriteAt` at disjoint offsets into the `.part` file, flushing state periodically
+   and finally.
 8. **Verify** — for `info.size > 0`, `st.completedBytes()` must equal `info.size`
    (the bytes-actually-written check), then `verifySize(dst, info.size)`, then
-   `verifyChecksum(output, opts.Checksum)`.
-9. **Cleanup** — on success `st.Remove(statePath)` deletes the sidecar; on failure
-   the sidecar + partial file are retained.
+   `verifyChecksum(part, opts.Checksum)`.
+9. **Finalize + cleanup** — on success an atomic same-directory
+   `os.Rename(part, opts.Output)` publishes the verified file onto the final path,
+   then `st.Remove(statePath(part))` deletes the sidecar (rename strictly before
+   sidecar removal). On failure the `.part` file + sidecar are retained and
+   `opts.Output` is never touched. See §5 for the full finalize/staging lifecycle.
 
 ---
 
@@ -184,10 +194,12 @@ Step-by-step (`download.Run` → `runSegmentedDownload`):
 
 ## 5. Durable resume design
 
-### Sidecar schema — `<output>.dr.json`
+### Sidecar schema — `<output>.part.dr.json`
 
-Path is `statePath(output) = output + ".dr.json"`. Serialized from the `State`
-struct in `state.go`. The real JSON fields:
+The sidecar travels with the `.part` staging file: the path is
+`statePath(partPath(output)) = output + ".part.dr.json"`. `statePath` itself is
+unchanged (`statePath(p) = p + ".dr.json"`); it is simply called with the `.part`
+path. Serialized from the `State` struct in `state.go`. The real JSON fields:
 
 ```json
 {
@@ -245,29 +257,63 @@ user gets the right message:
 ### On-disk partial-file revalidation
 
 Even when `Matches` passes, the cursors are only trustworthy if the partial data
-file on disk is consistent with them. `partialFileUsable(output, saved.Size)`:
+file on disk is consistent with them. `partialFileUsable(part, saved.Size)` checks
+the `<output>.part` staging file:
 
 - returns `false` if `size <= 0` (never the segmented/pre-allocated path);
-- `os.Stat`s the output; returns `false` if it is missing;
+- `os.Stat`s the `.part` file; returns `false` if it is missing;
 - returns `fi.Size() == size` — the file must still be at the pre-allocated size.
 
 If this check fails the sidecar is discarded and the run restarts fresh. This is
-the guard that prevents resuming against a deleted or truncated file and emitting a
-sparse, zero-holed file as "success". Regression coverage:
+the guard that prevents resuming against a deleted or truncated `.part` file and
+emitting a sparse, zero-holed file as "success". Regression coverage:
 `TestRunResumeMissingFileRestartsFresh` and
 `TestRunResumeTruncatedFileRestartsFresh`.
 
 ### Sidecar lifecycle: created / flushed / removed / retained
 
 - **Created/flushed**: only on the segmented path. `runSegmented` runs a ticker
-  every `stateFlushInterval` (1s) calling `st.Save(statePath)`, and always does one
-  **final** `Save` after the workers finish (or are cancelled). The single-stream
-  path never creates a sidecar (verified by `TestRunSingleStreamNoLength`).
-- **Removed**: on full success, after verification, via `st.Remove(statePath)`
-  (a missing file is not an error).
+  every `stateFlushInterval` (1s) calling `st.Save(sp)` where `sp = statePath(part)`
+  (`<output>.part.dr.json`), and always does one **final** `Save` after the workers
+  finish (or are cancelled). The single-stream path never creates a sidecar
+  (verified by `TestRunSingleStreamNoLength`).
+- **Removed**: on full success, after the `.part` is renamed onto the final path,
+  via `st.Remove(sp)` (a missing file is not an error).
 - **Retained**: on any failure or interruption, `runSegmentedDownload` returns the
   download error without removing anything — the periodic/final flush has already
-  persisted progress, so a later run resumes from the cursors.
+  persisted progress, so a later run resumes from the cursors. `opts.Output` is
+  never touched.
+
+### Atomic output staging (`.part` → final via `os.Rename`)
+
+The final path `opts.Output` is never written in place. Both strategies stage the
+bytes into a sibling `<output>.part` file (`part := partPath(opts.Output)`), and
+`opts.Output` is touched exactly once, by an atomic same-directory
+`os.Rename(part, opts.Output)` performed only after verification passes:
+
+1. **Write** all bytes into `<output>.part` (`os.OpenFile(part, ...)`).
+2. **Verify** — `verifySize(dst, info.size)` and, on the segmented path, the
+   `st.completedBytes() == info.size` bytes-written gate, then close `dst`, then
+   `verifyChecksum(part, opts.Checksum)` (surfacing `ErrSizeMismatch` /
+   `ErrChecksumMismatch` on failure).
+3. **Rename** `os.Rename(part, opts.Output)` atomically publishes the verified file
+   onto the final path in one step (the only touch of `opts.Output`).
+4. **Remove sidecar** (segmented only) — `st.Remove(statePath(part))`.
+
+The rename happens **strictly before** the sidecar removal. Ordering matters: if the
+rename fails it is returned wrapped (`download: finalize output`) and both the
+`.part` and its sidecar are **retained** so the next run can retry/resume; the final
+path is never left holding a partial or unverified file. A crash *between* the
+rename and the sidecar removal leaves a harmless orphan sidecar with no `.part`; the
+next run's `LoadState` → `partialFileUsable(part)` then fails and the run starts
+fresh, removing the orphan on its next success. A stale `.part` left by an earlier
+failed run is simply overwritten on a fresh start (segmented: `dst.Truncate`;
+single-stream: `runSingle` truncates to 0).
+
+The rename is atomic on POSIX (same-directory rename overwrites any pre-existing
+final file). On Windows `os.Rename` fails when the target exists; a future port
+would need an `os.ReplaceFile` / remove-then-rename shim (out of scope, per the code
+comments).
 
 ---
 
@@ -384,15 +430,20 @@ the status for classification.
 
 ## 9. Correctness decisions / invariants
 
-- **Single pre-allocated file, no temp-merge.** Fresh segmented runs
-  `dst.Truncate(info.size)` once and every chunk writes in place via `WriteAt`.
-  There is no per-chunk temp file and no merge step (the v1 `MergeFiles` is gone).
-  This removes the entire class of merge-ordering/merge-corruption bugs.
-- **Bytes-written is the real integrity gate.** Because the file is pre-allocated,
-  its on-disk size always equals `info.size` regardless of how many bytes actually
-  arrived. So the meaningful check is `st.completedBytes() == info.size`; a short
-  server response leaves a zero hole that is reported as `ErrSizeMismatch` instead
-  of being accepted.
+- **Single pre-allocated staging file, no temp-merge.** Fresh segmented runs
+  `dst.Truncate(info.size)` once on the `<output>.part` staging file and every chunk
+  writes into it via `WriteAt`. There is no per-chunk temp file and no merge step
+  (the v1 `MergeFiles` is gone). This removes the entire class of merge-ordering/
+  merge-corruption bugs.
+- **Final path goes from absent straight to verified.** `opts.Output` is never
+  written in place; it is produced by a single atomic `os.Rename(part, opts.Output)`
+  performed only after size + checksum verification, so the final path never holds a
+  partial, zero-holed, or unverified file (see §5 staging).
+- **Bytes-written is the real integrity gate.** Because the `.part` file is
+  pre-allocated, its on-disk size always equals `info.size` regardless of how many
+  bytes actually arrived. So the meaningful check is `st.completedBytes() ==
+  info.size`; a short server response leaves a zero hole that is reported as
+  `ErrSizeMismatch` (before any rename) instead of being accepted.
 - **Integer `ceilDiv`.** `planChunks` uses `ceilDiv(a, b) = (a + b - 1) / b` (with
   `b == 0 ⇒ 0`) — pure integer arithmetic, no float rounding. It also clamps the
   chunk count to `min(concurrency, size)` so no chunk is empty, and chunks are
@@ -423,12 +474,13 @@ the status for classification.
 This rewrite eliminates eight concrete v1 bugs:
 
 1. **Missing resume.** v1 advertised resume but never honored a sidecar. v2 has a
-   real `<output>.dr.json` with per-chunk `done` cursors, `Matches`/
+   real `<output>.part.dr.json` with per-chunk `done` cursors, `Matches`/
    `partialFileUsable` validation, and a resume path that issues Range requests
    from non-zero offsets (`TestRunInterruptThenResumeRoundTrip`).
 2. **Broken `MergeFiles`.** v1 downloaded chunks to temp files and merged them,
-   with a faulty merge. v2 deletes the whole merge concept: one pre-allocated file
-   written in place via `WriteAt` at disjoint offsets.
+   with a faulty merge. v2 deletes the whole merge concept: one pre-allocated
+   `<output>.part` staging file written via `WriteAt` at disjoint offsets, then
+   atomically renamed onto the final path.
 3. **No-range corruption.** v1 could write a ranged/partial body as if it were the
    whole file. v2 validates 206 (`fetchChunk` ⇒ `ErrRangeNot206`) on the segmented
    path and rejects an anomalous 206 on the single-stream path.

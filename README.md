@@ -104,10 +104,20 @@ are shown:
 45.30 MiB  12.00 MiB/s
 ```
 
+## Atomic output
+
+`dr` never writes to the final filename in place. Bytes are staged in a
+`<output>.part` file, and only after the download is complete and size +
+checksum verification pass is it atomically renamed onto `<output>` (a single
+same-directory `os.Rename`). So the final path either does not exist yet or is a
+complete, verified file — an observer never sees a half-written or zero-holed
+file at the real name. On interruption or failure the `.part` is kept and the
+final path is left untouched.
+
 ## How Resume Works
 
-On a segmented download, `dr` writes a sidecar named `<output>.dr.json` next to
-the destination file. The sidecar records:
+On a segmented download, `dr` writes a sidecar named `<output>.part.dr.json`
+alongside the `.part` staging file. The sidecar records:
 
 - the per-chunk byte cursors (how many bytes of each chunk are already on disk), and
 - a remote validator: the total size plus the server's `ETag` and/or
@@ -115,11 +125,13 @@ the destination file. The sidecar records:
 
 Re-running the same command reloads the sidecar and continues each unfinished
 chunk with an HTTP `Range` request, skipping bytes already written. Bytes land
-directly in the pre-allocated destination file via `WriteAt`, so no temporary
-files or merge step are involved.
+directly in the pre-allocated `.part` file via `WriteAt`, so there is no merge
+step.
 
-The sidecar is removed after a successful, fully verified download, and retained
-on interruption or failure so the next run can resume.
+On success the `.part` is renamed onto the final path and the sidecar is
+removed. On interruption or failure both are retained so the next run can
+resume. A stale `.part` left by an unrelated earlier attempt is overwritten when
+a fresh download starts.
 
 If the remote has changed since the saved state - a different size, or a
 different `ETag`/`Last-Modified` - resuming is refused rather than silently

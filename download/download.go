@@ -2,10 +2,12 @@
 //
 // The end-to-end flow is: probe the remote for size and range support, plan a
 // set of disjoint byte chunks, (optionally) load durable resume state, download
-// every not-yet-complete chunk concurrently writing into a single pre-allocated
-// destination file via os.File.WriteAt, then verify size and optional checksum.
-// On success the resume sidecar is removed; on failure or interruption the
-// sidecar and partial file are retained so a later run can resume.
+// every not-yet-complete chunk concurrently into a single pre-allocated
+// "<output>.part" staging file via os.File.WriteAt, verify size and optional
+// checksum, then atomically rename the .part onto the final path. The final path
+// is never written in place, so it only ever appears as a complete, verified
+// file. On success the resume sidecar is removed; on failure or interruption the
+// .part file and its sidecar are retained so a later run can resume.
 //
 // All bytes are staged into a sibling "<output>.part" file (see partPath); the
 // segmented resume sidecar travels with it as "<output>.part.dr.json". The final
