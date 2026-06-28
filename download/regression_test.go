@@ -282,6 +282,61 @@ func TestRunResumeNoValidatorMatchingSizeRestartsFresh(t *testing.T) {
 	assert.True(t, os.IsNotExist(statErr), "sidecar removed on success")
 }
 
+// TestRunCompletePartButAbsentFinalDoesNotSkip pins the resume-vs-skip boundary:
+// a complete-size <output>.part PLUS a valid matching sidecar, but with the FINAL
+// path absent, must NOT trigger the skip short-circuit (alreadyComplete stats only
+// the final path). It must fall through to the resume/download path and fetch the
+// body, then produce the correct final file. This guards alreadyComplete against a
+// future refactor that mistakenly consulted the .part instead of the final file.
+func TestRunCompletePartButAbsentFinalDoesNotSkip(t *testing.T) {
+	t.Parallel()
+	payload := []byte(strings.Repeat("boundary", 4096)) // 32 KiB
+	etag := `"boundary-v1"`
+	var fullGets int32
+	srv := countingServer(t, payload, etag, true, &fullGets)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "file.bin")
+
+	// Pre-allocate a complete-size .part (the fresh path Truncate(size) shape) and a
+	// valid sidecar that matches the remote (size + ETag). This is the strongest
+	// "looks complete" decoy: if alreadyComplete wrongly keyed off the .part it would
+	// skip. The FINAL path is left absent.
+	require.NoError(t, os.WriteFile(partPath(out), make([]byte, len(payload)), 0o644))
+	st := &State{
+		URL:         srv.URL,
+		Size:        int64(len(payload)),
+		ETag:        etag,
+		Concurrency: 1,
+		// Done: 0 so the whole chunk is (re)fetched from the server. The decoy is the
+		// complete-size .part + valid sidecar with an absent final file; what is being
+		// asserted is that skip is declined (body IS fetched) and the final file is
+		// correct — not the resume offset arithmetic.
+		Chunks: []ChunkState{
+			{Index: 0, Start: 0, End: int64(len(payload)) - 1, Done: 0},
+		},
+	}
+	require.NoError(t, st.Save(statePath(partPath(out))))
+	_, statErr := os.Stat(out)
+	require.True(t, os.IsNotExist(statErr), "final path must be absent for this test")
+
+	opts := baseOpts(t, srv.URL, out)
+	opts.Client = srv.Client()
+	opts.Concurrency = 1
+
+	require.NoError(t, Run(context.Background(), opts))
+	assert.GreaterOrEqual(t, atomic.LoadInt32(&fullGets), int32(1),
+		"complete-size .part with absent final must download (resume), not skip")
+
+	got, err := os.ReadFile(out)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+
+	_, statErr = os.Stat(statePath(partPath(out)))
+	assert.True(t, os.IsNotExist(statErr), "sidecar removed on success")
+}
+
 // TestFetchChunkMidStream200NotRetried verifies a non-206 (200) response to a
 // chunk fetch fails fast (single handler invocation) rather than burning retries.
 func TestFetchChunkMidStream200NotRetried(t *testing.T) {

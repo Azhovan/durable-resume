@@ -17,6 +17,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// runFunc is the download entry point invoked by RunE. It is a package-level var
+// (defaulting to download.Run) solely so tests can intercept the fully-built
+// download.Options and assert that flags (e.g. --force) are wired into the struct,
+// without performing a real download. Production never reassigns it.
+var runFunc = download.Run
+
 // NewRootCmd builds the single `dr <url> [flags]` command. version/revision/date
 // come from main's ldflag vars and feed cobra's Version field (surfaced by --version).
 func NewRootCmd(version, revision, date string) *cobra.Command {
@@ -30,6 +36,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 		headers     []string
 		quiet       bool
 		verbose     bool
+		force       bool
 	)
 
 	cmd := &cobra.Command{
@@ -60,6 +67,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				Output:      output,
 				Concurrency: concurrency,
 				Resume:      resume,
+				Force:       force,
 				Checksum:    sum,
 				Timeout:     timeout,
 				MaxRetries:  retries,
@@ -72,7 +80,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
-			return download.Run(ctx, opts)
+			return runFunc(ctx, opts)
 		},
 	}
 
@@ -86,6 +94,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 	flags.StringArrayVarP(&headers, "header", "H", nil, `extra request header "Key: Value" (repeatable)`)
 	flags.BoolVarP(&quiet, "quiet", "q", false, "suppress progress output")
 	flags.BoolVarP(&verbose, "verbose", "v", false, "extra logging")
+	flags.BoolVarP(&force, "force", "f", false, "re-download even if the destination already exists")
 
 	return cmd
 }

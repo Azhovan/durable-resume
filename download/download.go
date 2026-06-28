@@ -67,6 +67,7 @@ type Options struct {
 	Output      string        // raw user -o/--output value: "" (derive after probe), an existing directory (place derived name inside), or a normal path (verbatim). Run resolves it to the final path after probe.
 	Concurrency int           // parallel chunks; clamped to >=1 inside Run
 	Resume      bool          // false when --no-resume
+	Force       bool          // re-download even if a complete file already exists at the final path
 	Checksum    Checksum      // optional sha256 verification
 	Timeout     time.Duration // http client timeout (0 = none; ctx still applies)
 	MaxRetries  int           // per-chunk retry attempts
@@ -113,6 +114,18 @@ func Run(ctx context.Context, opts Options) error {
 	opts.Output = resolved
 	vlogf(opts, "output: resolved %q (cd=%q finalURL=%q)", resolved, info.contentDisposition, info.finalURL)
 
+	// 2b. SKIP-IF-COMPLETE: when the final file already exists and is verifiably
+	// complete (and --force is not set), short-circuit with no body fetch. Uses the
+	// resolved final path and the probed size; never touches/creates a .part or
+	// sidecar, so resume semantics are untouched.
+	if skip, why := alreadyComplete(opts, info); skip {
+		vlogf(opts, "skip: %s", why)
+		skippedf(opts)
+		return nil
+	} else {
+		vlogf(opts, "skip: not skipping (%s)", why)
+	}
+
 	// 3. STRATEGY
 	if !info.streamable() {
 		vlogf(opts, "strategy: single sequential stream (no ranges or unknown size)")
@@ -139,6 +152,18 @@ func savedf(opts Options) {
 		return
 	}
 	fmt.Fprintf(opts.Out, "dr: saved to %s\n", opts.Output)
+}
+
+// skippedf prints "dr: <path> already complete; skipping (use --force to
+// re-download)" to opts.Out unless --quiet (independent of --verbose). No-op when
+// Out is nil. Distinct from vlogf so it shows without -v. Emitted only on the
+// skip-if-complete short-circuit, before any .part/sidecar work, so it never
+// interleaves with progress.
+func skippedf(opts Options) {
+	if opts.Quiet || opts.Out == nil {
+		return
+	}
+	fmt.Fprintf(opts.Out, "dr: %s already complete; skipping (use --force to re-download)\n", opts.Output)
 }
 
 // runSingleStream handles the non-streamable path: a single sequential stream

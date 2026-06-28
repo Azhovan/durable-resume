@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -209,6 +210,60 @@ func TestNewRootCmdFlagDefaults(t *testing.T) {
 	verbose, err := flags.GetBool("verbose")
 	require.NoError(t, err)
 	assert.False(t, verbose)
+
+	force, err := flags.GetBool("force")
+	require.NoError(t, err)
+	assert.False(t, force)
+}
+
+func TestNewRootCmdForceFlag(t *testing.T) {
+	t.Parallel()
+	cmd := NewRootCmd("v", "r", "d")
+	f := cmd.Flags().Lookup("force")
+	require.NotNil(t, f, "force flag should be registered")
+	assert.Equal(t, "f", f.Shorthand)
+	assert.Equal(t, "false", f.DefValue)
+}
+
+// TestRunEWiresForceIntoOptions exercises the RunE closure end-to-end and asserts
+// the --force flag is copied into download.Options.Force (default false). It
+// intercepts runFunc so no real download occurs; this pins the flag->struct wiring
+// (root.go `Force: force`) that the flag-registration tests above do not cover, so a
+// regression dropping that assignment (making --force a silent no-op) would fail.
+func TestRunEWiresForceIntoOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantForce bool
+	}{
+		{name: "no flag defaults false", args: []string{"http://example.com/file.bin"}, wantForce: false},
+		{name: "--force sets true", args: []string{"http://example.com/file.bin", "--force"}, wantForce: true},
+		{name: "-f sets true", args: []string{"http://example.com/file.bin", "-f"}, wantForce: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			// Not parallel: swaps the package-level runFunc.
+			orig := runFunc
+			t.Cleanup(func() { runFunc = orig })
+
+			var captured download.Options
+			var called bool
+			runFunc = func(_ context.Context, opts download.Options) error {
+				called = true
+				captured = opts
+				return nil
+			}
+
+			cmd := NewRootCmd("v", "r", "d")
+			cmd.SetArgs(tt.args)
+			require.NoError(t, cmd.Execute())
+
+			require.True(t, called, "runFunc must be invoked by RunE")
+			assert.Equal(t, tt.wantForce, captured.Force)
+		})
+	}
 }
 
 // ensure the command type is what callers expect.
