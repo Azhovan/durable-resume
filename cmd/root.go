@@ -328,6 +328,12 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 		"emit one machine-readable JSON object per download to stdout (NDJSON); "+
 			"implies --quiet for human output and cannot be combined with -o -")
 
+	// Wire shell-completion behavior (per-flag + positional) and attach the lone
+	// `completion` helper subcommand. Must run AFTER every flag is defined so
+	// RegisterFlagCompletionFunc resolves each name; does not change root Args
+	// parsing or download dispatch.
+	registerCompletions(cmd)
+
 	return cmd
 }
 

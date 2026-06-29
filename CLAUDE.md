@@ -17,6 +17,7 @@ nothing (cobra + testify) and keeps all I/O and concurrency in the stdlib.
 
 - `main.go` — entrypoint; injects `Version`/`Revision`/`Date` via `-ldflags` and calls `cmd.NewRootCmd(...).Execute()`.
 - `cmd/` — cobra CLI (`root.go`): flag parsing, URL/header/checksum validation, SIGINT/SIGTERM context, builds `download.Options`, calls `download.Run`.
+  - `completion.go` — the single sanctioned `completion [bash|zsh|fish|powershell]` helper subcommand plus per-flag/positional completion wiring (`registerCompletions`, called at the end of `NewRootCmd`).
 - `download/` — the engine (one concern per file):
   - `download.go` — `Run`, `Options`, sentinel errors, strategy selection, segmented orchestration, verify+cleanup.
   - `probe.go` — `probe`: ranged `GET bytes=0-0` then HEAD fallback; learns size/ranges/etag/last-modified.
@@ -47,6 +48,7 @@ nothing (cobra + testify) and keeps all I/O and concurrency in the stdlib.
 - **Segmented writes are lock-free by construction.** Every chunk writes via `WriteAt` at disjoint absolute offsets, so file writes need no mutex. `fetchChunk` caps reads to the bytes still owed (`want`) and fails fatally on an over-length 206 so a misbehaving server can never spill into a neighbour's region. Do not add a write lock, and do not let any path write past `ch.end`.
 - **`gofmt`/`gofumpt` clean** before commit (see above).
 - **Sidecar removed only on success.** `st.Remove(sp)` runs only after a clean download + size/checksum verify. On any failure or interrupt, retain both the sidecar and the partial file so the next run can resume.
+- **`completion` is the ONE sanctioned subcommand.** dr's identity is "binary `dr`, no subcommands", with the single conventional exception `dr completion [bash|zsh|fish|powershell]` (gh/kubectl precedent). cobra v1.8.0 does NOT auto-add a completion command for a no-subcommand root (`InitDefaultCompletionCmd` early-returns on `!c.HasSubCommands()`), so it is added explicitly in `cmd/completion.go` via `registerCompletions(cmd)` at the END of `NewRootCmd` (after all flags). It does NOT change root `Args` (still `cobra.ArbitraryArgs`), `RunE`, or download dispatch — `dr <url>` is byte-for-byte unchanged. Path flags `-o`/`-i` complete files (registered func returning `ShellCompDirectiveDefault`, NOT `MarkFlagFilename`); every value flag (`concurrency`/`timeout`/`retries`/`header`/`mirror`/`limit-rate`/`proxy`) and the positional URLs use `cobra.NoFileCompletions`; `--checksum` hints `sha256:`. No new deps (cobra's own generators). Do NOT "fix" this by deleting the subcommand or adding others.
 
 ## Download-engine invariants
 

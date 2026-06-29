@@ -31,6 +31,19 @@ go install github.com/azhovan/durable-resume/v3@latest
 
 Or build from source — see [Build & test](#build--test).
 
+### Shell completions
+
+`completion` is `dr`'s single helper subcommand (the conventional gh/kubectl exception); it does not change the no-subcommand download UX. Enable for the current shell:
+
+```shell
+source <(dr completion bash)                          # bash (needs bash-completion v2)
+source <(dr completion zsh)                           # zsh  (once: autoload -U compinit; compinit)
+dr completion fish | source                           # fish
+dr completion powershell | Out-String | Invoke-Expression   # PowerShell
+```
+
+Run `dr completion --help` for persistent-install one-liners per shell.
+
 ## Quickstart
 
 ```shell
