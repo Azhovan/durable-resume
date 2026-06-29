@@ -1,396 +1,186 @@
-# Durable Resume
+# dr — durable, resumable, parallel downloads
 
-A reliable file downloader with durable resume, parallel segmented downloading, and optional integrity verification.
+[![CI](https://github.com/azhovan/durable-resume/actions/workflows/test.yml/badge.svg)](https://github.com/azhovan/durable-resume/actions/workflows/test.yml)
+![Go 1.22+](https://img.shields.io/badge/go-1.22%2B-00ADD8)
 
-## Key Features
+A single-binary download manager (Go, stdlib-only) built around bulletproof resume: parallel segmented downloads, durable per-chunk resume, atomic output, and mirror failover — the resilience `curl`/`wget` lack, without `aria2`'s footprint. The binary is `dr`; there are no subcommands.
 
-- **Simple CLI**: Just `dr <URL>` - no subcommands required
-- **Segmented downloads**: Parallel byte-range chunks written into a single pre-allocated file
-- **Durable resume**: Per-chunk progress is persisted to a sidecar and resumed via HTTP Range
-- **Live progress**: Speed, transferred/total, and ETA, rendered only on a TTY
-- **Integrity**: Final size check plus optional sha256 verification
-- **Mirror failover**: Pass `-m/--mirror` alternates for one file; `dr` fails over in order and even resumes the partial across mirrors
-- **Flexible**: HTTP/HTTPS, custom output paths, custom headers, and a quiet mode for scripting
+## Why dr
 
-## Installation
+| Capability | dr | curl | wget | aria2 |
+|---|---|---|---|---|
+| Parallel segmented (byte-range) download | yes | no | no | yes |
+| Durable per-chunk resume (survives crash/Ctrl-C) | yes | partial | partial | yes |
+| Resume across mirrors | yes | no | no | partial |
+| Mirror failover (alternate sources, in order) | yes | no | no | yes |
+| Atomic output (`.part` → rename, no half-written file) | yes | no | no | no |
+| sha256 verification | yes | no | no | yes |
+| Batch (multiple URLs / `-i` list, continue-on-error) | yes | yes | yes | yes |
+| Aggregate `--limit-rate` across workers | yes | per-conn | yes | yes |
+| Machine-readable NDJSON output | yes | no | no | no |
+| Single static binary, no non-stdlib deps | yes | — | — | no |
+
+`partial`/`per-conn` are honest qualifiers, not knocks: e.g. `curl -C -`/`wget -c` resume a single sequential stream but not per-chunk; `aria2` does mirror failover but without `dr`'s atomic single-file staging.
+
+## Install
 
 ```shell
-go install github.com/azhovan/durable-resume@latest
+go install github.com/azhovan/durable-resume@v3.9.0
 ```
 
-## Usage
+> Note: use the pinned tag above, not `@latest`. The module path has no `/v3` suffix yet, so `@latest` resolves to an old `v0.x` tag rather than the current release. (Or build from source — see [Build & test](#build--test).)
 
-### Basic Examples
+## Quickstart
 
 ```shell
-# Download to current directory (filename from Content-Disposition or the URL)
-dr https://example.com/file.zip
+# Parallel, resumable download. Ctrl-C, then re-run the SAME command to resume.
+dr https://example.com/big.iso -c 8
 
-# Download to a specific path
-dr https://example.com/file.zip -o myfile.zip
+# Mirror failover for ONE file: try primary, then each mirror in order; resumes across them.
+dr https://a.example/big.iso -m https://b.example/big.iso -m https://c.example/big.iso -o big.iso
 
-# Download into a directory (the filename is resolved automatically)
-dr https://example.com/download?id=42 -o ~/Downloads
-
-# More parallel chunks
-dr https://example.com/largefile.iso -c 8
-
-# Disable resume (start fresh, ignore any sidecar)
-dr https://example.com/file.zip --resume=false
-
-# Re-download even if the file already exists and is complete
-dr https://example.com/file.zip --force
-
-# Stream to stdout to pipe into another program
-dr https://example.com/archive.tar.gz -o - | tar xz
-
-# Download several files into a directory
-dr https://example.com/a.zip https://example.com/b.zip -o ~/Downloads
-
-# Download every URL listed in a file (one per line; # comments allowed)
+# Batch: download every URL in a file into a directory (continue-on-error).
 dr -i urls.txt -o ~/Downloads
 
-# Mirror failover: try the primary, then each mirror in order, for ONE file
-dr https://a.example/file.iso -m https://b.example/file.iso -m https://c.example/file.iso -o file.iso
+# Stream to stdout to compose in a pipeline.
+dr https://example.com/archive.tar.gz -o - | tar xz
 
-# Verify integrity with sha256
-dr https://example.com/file.zip --checksum sha256:<hex>
-
-# Send custom request headers (repeatable)
-dr https://example.com/file.zip -H "Authorization: Bearer <token>"
-
-# Quiet mode for scripting
-dr https://example.com/config.json --quiet
-
-# Verbose mode for debugging
-dr https://example.com/file.tar.gz --verbose
+# Verify integrity.
+dr https://example.com/big.iso --checksum sha256:<hex>
 ```
 
-### Command Options
+## Output filenames
 
-```
-Usage: dr <url> [flags]
-
-  -o, --output string        destination file or directory, or - for stdout (default: Content-Disposition or URL name)
-  -i, --input-file string    read URLs from a file, one per line (blank/# lines skipped; - = stdin)
-  -c, --concurrency int      number of parallel chunks (default 4)
-      --resume               resume a previous interrupted download (default true)
-  -f, --force                re-download even if the destination already exists
-      --checksum string      verify with "sha256:<hex>"
-      --timeout duration     per-request HTTP timeout (0 = none) (default 30s)
-      --retries int          per-chunk retry attempts (default 3)
-  -H, --header stringArray   extra request header "Key: Value" (repeatable)
-  -m, --mirror stringArray   alternate URL serving the SAME file; tried in order if the primary fails (repeatable). Only valid with exactly one positional URL.
-      --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)
-      --proxy string         route through proxy URL (http/https/socks5/socks5h); when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored
-      --json                 emit one machine-readable JSON object per download to stdout (NDJSON); implies --quiet and cannot be combined with -o -
-  -q, --quiet                suppress progress output
-  -v, --verbose              extra logging
-      --version              version for dr
-```
-
-`--resume` defaults to `true`; pass `--resume=false` to disable it. Only `http`
-and `https` URLs are supported.
-
-### Output filename
-
-When `-o/--output` is omitted (or names an existing directory), `dr` chooses the
-filename like `curl -OJ` / `wget --content-disposition`, in this order:
+When `-o/--output` is omitted (or names an existing directory), `dr` chooses the filename like `curl -OJ` / `wget --content-disposition`, in order:
 
 1. an explicit `-o <file>` path (used verbatim);
-2. the server's `Content-Disposition` filename, including the RFC 5987
-   `filename*` UTF-8 form;
+2. the server's `Content-Disposition` filename (including the RFC 5987 `filename*` UTF-8 form);
 3. the basename of the **final** URL after redirects;
 4. the basename of the requested URL;
 5. `download` as a last resort.
 
-A server-supplied name is reduced to a single safe path component, so a malicious
-`Content-Disposition` cannot write outside the destination directory. On success
-`dr` prints `dr: saved to <path>` (unless `--quiet`).
+A server-supplied name is reduced to a single safe path component, so a malicious `Content-Disposition` cannot write outside the destination directory. On success `dr` prints `dr: saved to <path>` (unless `--quiet`).
 
-## Progress Display
+## Behavior & guarantees
 
-When stdout is a TTY and `--quiet` is not set, a single line is redrawn in place
-roughly five times per second. Sizes and rates use binary units (KiB, MiB, GiB).
+**Atomic output.** `dr` never writes the final filename in place. Bytes are staged in `<output>.part`, and only after the download completes and size + checksum verification pass is it atomically renamed onto `<output>` (a single same-directory `os.Rename`). The final path is therefore either absent or a complete, verified file — an observer never sees a half-written or zero-holed file. On interruption or failure the `.part` is kept and the final path is untouched.
 
-When the total size is known:
+**Durable resume.** A segmented download tracks per-chunk progress in a sidecar at `<output>.part.dr.json`. Re-running the same command resumes each unfinished chunk via an HTTP `Range` request — there is no merge step. If the remote changed (different size or `ETag`/`Last-Modified`), resume is refused rather than silently producing a corrupt file; pass `--resume=false` to discard the sidecar and start fresh. Resume defaults to on. (Internals: [docs/REFERENCE.md](docs/REFERENCE.md) and [Designs/ARCHITECTURE.md](Designs/ARCHITECTURE.md).)
 
-```
- 78.50% 1.20 GiB / 2.10 GiB  45.20 MiB/s  ETA 23s
-```
+**Skip-if-complete.** Re-running on a destination that already exists and is verifiably complete returns immediately without fetching. "Complete" means the `--checksum` matches if given, otherwise the on-disk size equals the size the server reports; if completeness cannot be proven (unknown size and no checksum), `dr` downloads normally. Pass `--force` (`-f`) to always re-download.
 
-When the size is unknown (no segmented plan), only transferred bytes and rate
-are shown:
+**Progress display.** When stdout is a TTY and `--quiet` is not set, a single line is redrawn in place ~5 times/second, using binary units (KiB/MiB/GiB):
 
 ```
-45.30 MiB  12.00 MiB/s
+ 78.50% 1.20 GiB / 2.10 GiB  45.20 MiB/s  ETA 23s     # size known
+45.30 MiB  12.00 MiB/s                                # size unknown
 ```
 
-## Atomic output
+## Advanced usage
 
-`dr` never writes to the final filename in place. Bytes are staged in a
-`<output>.part` file, and only after the download is complete and size +
-checksum verification pass is it atomically renamed onto `<output>` (a single
-same-directory `os.Rename`). So the final path either does not exist yet or is a
-complete, verified file — an observer never sees a half-written or zero-holed
-file at the real name. On interruption or failure the `.part` is kept and the
-final path is left untouched.
+### Batch downloads
 
-## Writing to stdout
+Pass multiple URLs as positional arguments and/or via `-i/--input-file` (one URL per line; blank lines and `#` comments ignored; `-` reads the list from stdin):
 
-Use `-o -` to stream the downloaded body to standard output, so `dr` composes in
-shell pipelines:
+```shell
+dr https://example.com/a.zip https://example.com/b.zip -o ~/Downloads
+dr -i urls.txt -o ~/Downloads
+```
+
+With multiple URLs, `-o` must be an existing directory and `--checksum` is not allowed. The batch is *continue-on-error*: every URL is attempted, a summary is printed (`dr: N of M downloads succeeded`, plus a line per failure), and `dr` exits non-zero if any failed.
+
+### Writing to stdout
+
+`-o -` streams the body to stdout so `dr` composes in pipelines:
 
 ```shell
 dr https://example.com/archive.tar.gz -o - | tar xz
 dr https://example.com/data.json -o - | jq .
 ```
 
-In this mode all progress and diagnostic output goes to stderr (never stdout, so
-the payload is never corrupted), and the download runs as a single sequential
-stream — `.part` staging, resume, and skip-if-complete don't apply to a pipe.
-Size is still verified against the server's `Content-Length` (a short stream
-exits non-zero). `--checksum` and multiple URLs cannot be combined with `-o -`.
+In this mode the body goes to stdout and all progress/diagnostics go to stderr (the payload is never corrupted). The download runs as a single sequential stream — `.part` staging, resume, and skip-if-complete don't apply to a pipe — but size is still verified against `Content-Length`. `--checksum`, multiple URLs, and `--json` cannot be combined with `-o -`.
 
-## Batch downloads
+### Mirror failover
 
-Pass more than one URL — as positional arguments and/or from a file with
-`-i/--input-file` (one URL per line; blank lines and lines starting with `#` are
-ignored; `-` reads the list from stdin):
+`-m/--mirror <url>` (repeatable) supplies alternate URLs serving the **same file** as the primary positional URL. `dr` tries the primary first, then each mirror in order, succeeding as soon as any source delivers a complete, verified file:
 
 ```shell
-dr https://example.com/a.zip https://example.com/b.zip -o ~/Downloads
-dr -i urls.txt -o ~/Downloads
+dr https://a.example/file.iso -m https://b.example/file.iso -m https://c.example/file.iso -o file.iso
 ```
 
-With multiple URLs, `-o` must be an existing directory (each file is named from
-its `Content-Disposition`/URL inside it) and `--checksum` is not allowed. The
-batch is *continue-on-error*: every URL is attempted, a summary is printed at the
-end (`dr: N of M downloads succeeded`, plus a line per failure), and `dr` exits
-non-zero if any download failed.
+- **One file only** — `--mirror` requires exactly one positional URL; it cannot be combined with batch mode.
+- **Resume across mirrors** — failover reuses the same `.part` and sidecar; if the next mirror reports the same size and validator, `dr` resumes instead of restarting (otherwise it starts fresh from that mirror).
+- **Checksum is a cross-mirror safety net** — `--checksum` is verified on the final file regardless of which mirror served the bytes, so a corrupt mirror is caught.
 
-## Machine-readable output (`--json`)
+Failover triggers, cancellation behavior, output naming, and stdout caveats: [docs/REFERENCE.md](docs/REFERENCE.md).
 
-`--json` makes `dr` scriptable: instead of human progress and `dr: ...` lines, it
-emits **NDJSON** — one compact JSON object per line — to **stdout**. A single URL
-emits exactly one line; a batch emits one line per URL, streamed as each download
-completes (so a pipeline sees results incrementally and survives a mid-batch
-kill). `--json` is **opt-in**; without it the human output is unchanged.
+### Rate limiting
 
-```shell
-# Print the URLs that failed in a batch
-dr --json -i urls.txt | jq -c 'select(.success | not) | .url'
+`--limit-rate <rate>` caps download speed (like `wget`/`curl --limit-rate`). The cap is an **aggregate** across all `-c` workers (`-c 4 --limit-rate 1M` ≈ 1 MiB/s total, not 4) and applies to every path (segmented, single-stream, stdout). The grammar is a number with an optional 1024-based suffix (`k`/`m`/`g` or `kib`/`mib`/`gib`); e.g. `500k`, `1.5M`. A bare number is bytes/s; `0`/empty is unlimited. In a batch the cap is per-download. Full unit table: [docs/REFERENCE.md](docs/REFERENCE.md).
 
-# Single download, inspect the verified digest
-dr --json --checksum sha256:<hex> -o file.iso https://example.com/file.iso | jq .
-```
+### Proxy
 
-Each record carries:
-
-| field     | type   | notes                                                              |
-|-----------|--------|--------------------------------------------------------------------|
-| `url`     | string | the requested (primary) URL                                        |
-| `output`  | string | the resolved final path                                            |
-| `bytes`   | int    | bytes written to the destination                                   |
-| `size`    | int    | probed total size; `-1` when unknown                               |
-| `sha256`  | string | verified lowercase hex; present **only** with `--checksum`         |
-| `resumed` | bool   | a matching resume sidecar was honored                              |
-| `skipped` | bool   | skip-if-complete short-circuit hit (`success` is then `true`)      |
-| `source`  | string | the URL that actually served the bytes (a mirror after failover)   |
-| `success` | bool   | whether the download succeeded                                     |
-| `error`   | string | failure message; present **only** when `success` is `false`        |
-
-`size`, `bytes`, `resumed`, `skipped`, and `success` are always present;
-`sha256`, `source`, and `error` are omitted when empty.
-
-IO routing: in `--json` mode **stdout carries only the NDJSON records**. All
-human output (the progress bar and `dr: saved to`/`skipping`/verbose lines) is
-suppressed — `--json` implies `--quiet` — and any residual diagnostics go to
-stderr, so the JSON stream is never corrupted. Records are emitted for **both
-success and failure** — even an invalid URL yields a record with `success:false`
-and a non-empty `error` (no record is ever dropped); in a batch `dr` still exits
-non-zero if any URL failed (no human "N of M" tally is printed). `--json`
-**cannot be combined with `-o -`** (both write to stdout) and is rejected before
-any download starts. `--json` with `--quiet` is allowed and behaves like `--json`
-alone. The multi-URL guards apply identically under `--json`: with more than one
-URL, `-o` must name an existing **directory** and `--checksum` is rejected (one
-digest cannot validate many files).
-
-## Mirror failover
-
-`-m/--mirror <url>` (repeatable) supplies alternate URLs that serve the **same
-file** as the primary positional URL. `dr` tries the primary first, then each
-mirror in order, and the download succeeds as soon as any source delivers a
-complete, verified file:
+`dr` honors the standard proxy environment variables by default (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and lowercase forms). Pass `--proxy <url>` to route one invocation through an explicit proxy; it **overrides** the environment, so `NO_PROXY` is not consulted. Accepted proxy schemes are `http`, `https`, `socks5`, `socks5h` (proxy only — the **download** URL stays `http`/`https`). The proxy is dialed by the Go stdlib, so no extra dependency is added.
 
 ```shell
-dr https://a.example/file.iso \
-   -m https://b.example/file.iso \
-   -m https://c.example/file.iso \
-   -o file.iso
-```
-
-Key behavior:
-
-- **One file only.** `--mirror` requires exactly one positional URL; it cannot be
-  combined with batch mode (multiple positional URLs or `-i/--input-file`). Each
-  mirror must be a valid `http`/`https` URL.
-- **Resume across mirrors.** Failover reuses the same `<output>.part` staging file
-  and resume sidecar. When the next mirror reports the same size *and* validator
-  (`ETag`/`Last-Modified`) as the partial on disk, `dr` **resumes** from where the
-  previous source left off instead of restarting. When the mirror's size/validator
-  differs, the partial is discarded and a **fresh** download starts from that
-  mirror.
-- **What triggers failover.** Any per-source failure advances to the next mirror:
-  a connection error, an HTTP 4xx/5xx, an exhausted-retry chunk failure, a size or
-  range mismatch, or a checksum mismatch. Only when **every** source is exhausted
-  does `dr` fail (reporting each source's error).
-- **Cancellation never burns a mirror.** Ctrl-C / `SIGTERM` (a context cancel or
-  timeout) aborts immediately without trying the next mirror; the `.part` and
-  sidecar are retained so a later run can resume.
-- **Checksum is a cross-mirror safety net.** `--checksum sha256:<hex>` is verified
-  on the final assembled file regardless of which mirror(s) served the bytes, so a
-  corrupt mirror is caught.
-- **Output naming is keyed on the primary.** The output filename (and the sidecar's
-  recorded URL) is derived from the primary URL, so failover never renames the
-  output mid-flight.
-- **stdout.** `-m` works with `-o -`, but a pipe cannot be rewound: failover only
-  happens *before* any byte is emitted (typically a probe/connect failure). Once a
-  source has written bytes to the pipe, a later error is returned rather than
-  replaying a mirror (which would duplicate the leading bytes). There is no resume
-  in stdout mode. `--checksum` with `-o -` remains rejected.
-
-## Limiting bandwidth
-
-`--limit-rate <rate>` caps the download speed, like `wget --limit-rate` /
-`curl --limit-rate`. The cap is an **aggregate** whole-download cap across all
-`-c/--concurrency` workers (with `-c 4 --limit-rate 1M` the total is ~1 MiB/s,
-not 4 MiB/s), and it applies to every path: segmented, single-stream, and
-`-o -` stdout.
-
-The grammar is `<number><unit>`, case-insensitive, where the unit is one of:
-
-| Unit              | Meaning              | Example   | Bytes/sec  |
-| ----------------- | -------------------- | --------- | ---------- |
-| *(none)* or `b`   | bytes                | `100000`  | 100000     |
-| `k` / `K` / `kib` | KiB (1024 bytes)     | `500k`    | 512000     |
-| `m` / `M` / `mib` | MiB (1024² bytes)    | `1M`      | 1048576    |
-| `g` / `G` / `gib` | GiB (1024³ bytes)    | `2g`      | 2147483648 |
-
-Suffixes are **1024-based** (matching `wget --limit-rate` and the binary units
-used in the progress display). A fractional number is allowed (`1.5M` =
-1572864 B/s). An empty value, `0`, or omitting the flag means **unlimited** — no
-limiter is allocated and throughput is byte-for-byte unchanged. A negative or
-unparseable value is rejected with an error before any download starts.
-
-In a batch, the cap is **per-download**: each URL is limited independently (it
-is not divided across the batch), matching `wget`'s per-invocation-per-file
-semantics.
-
-## Proxy support
-
-`dr` honors the standard proxy environment variables by default, exactly like
-`curl`/`wget` and Go's HTTP client: `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
-(and their lowercase forms `http_proxy`, `https_proxy`, `no_proxy`). When none
-are set, the connection is direct.
-
-Pass `--proxy <url>` to route a single invocation through an explicit proxy. It
-**overrides** the environment for that run, so the `NO_PROXY` bypass list is
-**not** consulted (an explicit `--proxy` always proxies). Accepted proxy schemes
-are `http`, `https`, `socks5`, and `socks5h` (`socks5h` delegates DNS
-resolution to the proxy). The proxy is dialed by the Go standard library, so no
-extra dependency is added.
-
-```shell
-# Honor the environment proxies (default)
 export HTTPS_PROXY=http://proxy.internal:8080
-dr https://example.com/file.zip
-
-# Override the environment for this invocation
-dr --proxy socks5://127.0.0.1:1080 https://example.com/file.zip
+dr https://example.com/file.zip                                  # honor env (default)
+dr --proxy socks5://127.0.0.1:1080 https://example.com/file.zip  # override for this run
 ```
 
-The proxy URL is validated before any download starts; an unparseable URL, a
-missing host, or an unsupported scheme is rejected up front. The **download**
-URL itself is still restricted to `http`/`https` — only the proxy URL may use
-`socks5`/`socks5h`.
+### Machine-readable output (`--json`)
 
-## Skipping completed downloads
-
-Re-running `dr` on a destination that already exists and is verifiably complete
-returns immediately without fetching the body. "Complete" means: the `--checksum`
-matches if one was given, otherwise the on-disk size equals the size the server
-reports. If completeness cannot be proven (unknown size and no checksum), or the
-existing file does not match, `dr` downloads normally. Pass `--force` (`-f`) to
-always re-download.
-
-## How Resume Works
-
-On a segmented download, `dr` writes a sidecar named `<output>.part.dr.json`
-alongside the `.part` staging file. The sidecar records:
-
-- the per-chunk byte cursors (how many bytes of each chunk are already on disk), and
-- a remote validator: the total size plus the server's `ETag` and/or
-  `Last-Modified`.
-
-Re-running the same command reloads the sidecar and continues each unfinished
-chunk with an HTTP `Range` request, skipping bytes already written. Bytes land
-directly in the pre-allocated `.part` file via `WriteAt`, so there is no merge
-step.
-
-On success the `.part` is renamed onto the final path and the sidecar is
-removed. On interruption or failure both are retained so the next run can
-resume. A stale `.part` left by an unrelated earlier attempt is overwritten when
-a fresh download starts.
-
-If the remote has changed since the saved state - a different size, or a
-different `ETag`/`Last-Modified` - resuming is refused rather than silently
-producing a corrupt file. The failure surfaces as `download: ... remote changed
-since saved state; cannot resume`. Use `--resume=false` to discard the sidecar
-and start fresh.
-
-## Error Handling
-
-On failure, `dr` prints a single concise line to stderr and exits non-zero:
-
-```
-dr: <error>
-```
-
-The download engine returns wrapped sentinel errors, so the message identifies
-the cause. Examples:
-
-```
-dr: scheme "ftp": download: only http and https are supported
-dr: download: checksum mismatch
-dr: download: size 1048576 vs 2097152: download: remote changed since saved state; cannot resume
-dr: invalid checksum hex "zz": encoding/hex: invalid byte: U+007A 'z'
-```
-
-## Building & Testing
+`--json` emits **NDJSON** — one compact JSON object per download — to stdout (implying `--quiet` for human output). A single URL emits one line; a batch streams one line per URL as each completes, so a pipeline sees results incrementally and survives a mid-batch kill. Records are emitted for both success and failure (each carries `url`, `success`, and on failure `error`); a batch still exits non-zero if any URL failed. `--json` cannot be combined with `-o -`.
 
 ```shell
-# Build the dr binary; ldflags inject version, revision, and date
-make build
-
-# Run the test suite with the race detector
-make test
-
-# Install into $GOBIN / $GOPATH/bin
-go install github.com/azhovan/durable-resume@latest
+dr --json -i urls.txt | jq -c 'select(.success | not) | .url'                # URLs that failed
+dr --json --checksum sha256:<hex> -o f.iso https://example.com/f.iso | jq .  # inspect the digest
 ```
 
-`make build` stamps `main.Version`, `main.Revision`, and `main.Date` via
-`-ldflags`; the values are surfaced by `dr --version`. `make test` runs
-`go test ./... -race`.
+Full record schema (all fields, types, presence rules): [docs/REFERENCE.md](docs/REFERENCE.md).
+
+## Flags
+
+Run `dr --help` for the full, always-current flag list and defaults. The most-used flags:
+
+| Flag | Purpose |
+|---|---|
+| `-o, --output` | destination file or directory, or `-` for stdout |
+| `-c, --concurrency` | number of parallel chunks (default 4) |
+| `-i, --input-file` | read URLs from a file (one per line; `-` = stdin) |
+| `-m, --mirror` | alternate URL for the same file (repeatable; one URL only) |
+| `--checksum` | verify with `sha256:<hex>` |
+| `--limit-rate` | cap speed, e.g. `500k`, `1M` |
+| `--proxy` | route through a proxy URL |
+| `--json` | emit NDJSON to stdout |
+| `-H, --header` | extra request header (repeatable) |
+| `--timeout` | per-request HTTP timeout (default 30s; 0 = none) |
+| `--retries` | per-chunk retry attempts (default 3) |
+| `-q, --quiet` / `-v, --verbose` | suppress / increase logging |
+| `--force` / `--resume` | re-download / control resume (default `--resume=true`) |
+
+Only `http` and `https` download URLs are supported.
+
+## Errors & exit codes
+
+On failure `dr` prints a single line `dr: <error>` to stderr and exits non-zero. The engine returns wrapped sentinel errors, so the message identifies the cause, e.g.:
+
+```
+dr: download: remote changed since saved state; cannot resume
+```
+
+## Build & test
+
+```shell
+make build   # cross-builds dr; ldflags inject version, revision, date (surfaced by `dr --version`)
+make test    # go test ./... -race
+```
 
 ## Roadmap
 
-The following are potential future work and are not yet implemented:
+Not yet implemented:
 
-- Dynamic segment adjustment based on network conditions
 - Configuration file support
-- Download queue management
 
 ## Contributing
 
