@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,6 +50,23 @@ var (
 	ErrChunkFailed       = errors.New("download: chunk failed after retries")
 )
 
+// stdoutDash is the conventional "-" output value that selects stdout streaming.
+const stdoutDash = "-"
+
+// stdoutMode reports whether the body should be streamed to the data sink (stdout)
+// instead of staged into a file. Triggered solely by Output == "-".
+func stdoutMode(opts Options) bool { return opts.Output == stdoutDash }
+
+// dataSink returns the io.Writer the downloaded body is written to in stdout mode.
+// A nil opts.Data means production: os.Stdout. Tests inject a *bytes.Buffer so the
+// real process stdout is never captured.
+func dataSink(opts Options) io.Writer {
+	if opts.Data != nil {
+		return opts.Data
+	}
+	return os.Stdout
+}
+
 // Checksum is an optional post-download integrity check. Algo is currently only
 // "sha256". The zero value (empty Algo) means "no checksum".
 type Checksum struct {
@@ -74,7 +92,8 @@ type Options struct {
 	Header      http.Header   // extra request headers (-H, repeatable)
 	Quiet       bool          // suppress progress
 	Verbose     bool          // extra logging to Out
-	Out         *os.File      // progress/diag sink, normally os.Stdout (injectable)
+	Out         *os.File      // MESSAGE sink (progress/diag); normally os.Stdout, but cmd sets os.Stderr in stdout mode (injectable). Type stays *os.File for isTTY.
+	Data        io.Writer     // DATA sink for stdout mode (Output=="-"); nil means os.Stdout via dataSink. Decoupled from the *os.File message sink; injectable for tests.
 	Client      *http.Client  // injectable for tests; nil => default built from Timeout
 }
 
@@ -102,6 +121,17 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("download: probe: %w", err)
 	}
 	vlogf(opts, "probe: size=%d acceptRanges=%t etag=%q lastModified=%q", info.size, info.acceptRanges, info.etag, info.lastModified)
+
+	// STDOUT MODE: a pipe is not seekable, cannot be stat'd, renamed, or resumed.
+	// Force a single sequential stream to the data sink and return BEFORE any
+	// resolveOutputPath / skip-if-complete / .part / rename / sidecar / strategy.
+	// The cmd layer routes opts.Out to stderr here so diagnostics never corrupt the
+	// piped payload, and rejects --checksum + multi-URL with "-" before we are even
+	// reached. Nothing was saved to a path, so no savedf is emitted.
+	if stdoutMode(opts) {
+		vlogf(opts, "strategy: single sequential stream to stdout (forced; pipe not seekable; no .part/resume/rename)")
+		return runStdoutStream(ctx, client, opts, info)
+	}
 
 	// 2. RESOLVE OUTPUT PATH (single source of truth; uses Content-Disposition and
 	// the post-redirect final URL captured by the probe). opts is a value copy
@@ -164,6 +194,37 @@ func skippedf(opts Options) {
 		return
 	}
 	fmt.Fprintf(opts.Out, "dr: %s already complete; skipping (use --force to re-download)\n", opts.Output)
+}
+
+// runStdoutStream streams the whole resource sequentially to the data sink
+// (os.Stdout in production, an injected io.Writer in tests) via plain Write, with
+// progress/diagnostics rendered to opts.Out (stderr in stdout mode). It uses NO
+// .part staging, no rename, no resume sidecar, and no WriteAt/Truncate/Seek, so it
+// is safe on a non-seekable pipe.
+//
+// copyToStream is invoked EXACTLY ONCE: a pipe cannot be rewound, so a retry after
+// any byte has been emitted would duplicate data on the consumer's stream. The body
+// stream therefore does not retry (MaxRetries is ignored for it); the probe above is
+// still a normal single request. Size is verified by COUNTING the bytes copied
+// against the probed size when known (>0); a shortfall is reported as ErrSizeMismatch
+// even though bytes were already emitted, so a pipeline gets a non-zero exit.
+func runStdoutStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo) error {
+	dst := dataSink(opts)
+
+	prog := NewProgress(info.size, opts.Out, opts.Quiet) // opts.Out is stderr here
+	prog.Start(ctx)
+	defer prog.Stop()
+
+	onBytes := func(n int64) { prog.Add(n) }
+
+	n, err := copyToStream(ctx, client, opts.URL, opts.Header, dst, onBytes)
+	if err != nil {
+		return err
+	}
+	if info.size > 0 && n != info.size {
+		return fmt.Errorf("download: streamed %d to stdout, want %d: %w", n, info.size, ErrSizeMismatch)
+	}
+	return nil
 }
 
 // runSingleStream handles the non-streamable path: a single sequential stream

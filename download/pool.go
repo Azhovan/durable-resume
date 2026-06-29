@@ -128,6 +128,66 @@ func classifyChunkError(err error) error {
 	return fmt.Errorf("%w: %w", ErrChunkFailed, err)
 }
 
+// copyToStream fetches the whole resource (no Range header) and copies the body to
+// w via plain Write in a fixed copyBufferSize loop, returning the bytes written. It
+// uses NO Truncate, NO WriteAt, and NO Seek, so w may be any io.Writer including a
+// non-seekable pipe (stdout). It honors ctx between reads and surfaces a short write
+// as io.ErrShortWrite. It performs NO internal retry: an error after partial
+// emission is returned as-is, and the caller (runStdoutStream) invokes it at most
+// once so emitted bytes are never duplicated. runSingle (the file path) is left
+// untouched.
+func copyToStream(ctx context.Context, c *http.Client, url string, hdr http.Header, w io.Writer, onBytes func(int64)) (int64, error) {
+	// No range header: fetch the whole resource.
+	req, err := newRequest(ctx, url, hdr, -1, -1)
+	if err != nil {
+		return 0, fmt.Errorf("download: build request: %w", err)
+	}
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("download: fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// No Range header was sent, so only 200 is valid; a 206 here is anomalous and
+	// would deliver only a partial body that we would otherwise stream as complete.
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("download: unexpected status %d: %w", resp.StatusCode, &httpStatusError{code: resp.StatusCode})
+	}
+
+	var total int64
+	buf := make([]byte, copyBufferSize)
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return total, cerr
+		}
+		nr, rerr := resp.Body.Read(buf)
+		if nr > 0 {
+			nw, werr := w.Write(buf[:nr])
+			if nw > 0 {
+				total += int64(nw)
+				if onBytes != nil {
+					onBytes(int64(nw))
+				}
+			}
+			if werr != nil {
+				return total, fmt.Errorf("download: write: %w", werr)
+			}
+			if nw < nr {
+				return total, fmt.Errorf("download: short write: %w", io.ErrShortWrite)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return total, fmt.Errorf("download: read: %w", rerr)
+		}
+	}
+
+	return total, nil
+}
+
 // runSingle streams the whole resource into dst sequentially (truncates dst to 0
 // first; no ranges, no resume). Returns the number of bytes copied.
 func runSingle(ctx context.Context, c *http.Client, url string, hdr http.Header, dst *os.File, onBytes func(int64)) (int64, error) {

@@ -40,6 +40,10 @@ var errBatchFailed = errors.New("some downloads failed")
 // without performing a real download. Production never reassigns it.
 var runFunc = download.Run
 
+// stdoutDash mirrors download's unexported sentinel: the conventional "-" output
+// value that streams the body to stdout (with diagnostics routed to stderr).
+const stdoutDash = "-"
+
 // NewRootCmd builds the single `dr <url> [flags]` command. version/revision/date
 // come from main's ldflag vars and feed cobra's Version field (surfaced by --version).
 func NewRootCmd(version, revision, date string) *cobra.Command {
@@ -102,15 +106,32 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				Out:         os.Stdout,
 			}
 
-			// SINGLE URL: byte-for-byte unchanged behavior.
+			stdout := output == stdoutDash
+
+			// SINGLE URL: byte-for-byte unchanged behavior, except for stdout mode.
 			if len(urls) == 1 {
 				if err := validateURL(urls[0]); err != nil {
 					return err
+				}
+				if stdout {
+					// Cannot verify a checksum before the bytes reach the consumer
+					// (the pipe cannot be re-read), so reject the combination outright.
+					if !sum.Empty() {
+						return fmt.Errorf("--checksum cannot be used when writing to stdout (-o -)")
+					}
+					// Decouple the sinks: the body goes to stdout (base.Data stays nil
+					// so download streams to os.Stdout), and ALL diagnostics go to
+					// stderr so they never corrupt the piped payload.
+					base.Out = os.Stderr
 				}
 				base.URL = urls[0]
 				return runFunc(ctx, base)
 			}
 
+			// MULTIPLE URLs: a single pipe cannot disambiguate multiple bodies.
+			if stdout {
+				return fmt.Errorf("-o - (stdout) cannot be used with multiple URLs")
+			}
 			// MULTIPLE URLs: multi-only global guards before any download.
 			if !sum.Empty() {
 				return fmt.Errorf("--checksum cannot be used with multiple URLs")
@@ -131,7 +152,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 	}
 
 	flags := cmd.Flags()
-	flags.StringVarP(&output, "output", "o", "", "destination file or directory (default: Content-Disposition or URL name)")
+	flags.StringVarP(&output, "output", "o", "", "destination file or directory, or - for stdout (default: Content-Disposition or URL name)")
 	flags.StringVarP(&inputFile, "input-file", "i", "",
 		`read URLs from a file, one per line (blank/# lines skipped; - = stdin)`)
 	flags.IntVarP(&concurrency, "concurrency", "c", download.DefaultConcurrency, "number of parallel chunks")

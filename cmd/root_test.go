@@ -712,5 +712,65 @@ func TestRunE_BadHeaderFailsFast(t *testing.T) {
 	}
 }
 
+// TestRunE_StdoutChecksumRejected confirms -o - with --checksum is rejected at the
+// cmd layer before any download (runFunc is never called).
+func TestRunE_StdoutChecksumRejected(t *testing.T) {
+	var calls int
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		calls++
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://example.com/file.bin", "-o", "-", "--checksum", "sha256:" + validChecksumHex})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checksum")
+	assert.Contains(t, err.Error(), "stdout")
+	assert.Equal(t, 0, calls, "no download must be attempted when -o - is combined with --checksum")
+}
+
+// TestRunE_StdoutMultiURLRejected confirms -o - with multiple URLs is rejected
+// before any download (runFunc is never called).
+func TestRunE_StdoutMultiURLRejected(t *testing.T) {
+	var calls int
+	stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+		calls++
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://a/x", "http://b/y", "-o", "-"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multiple URLs")
+	assert.Equal(t, 0, calls, "no download must be attempted when -o - is combined with multiple URLs")
+}
+
+// TestRunE_StdoutSingleURLWiring confirms that a single URL with -o - reaches
+// runFunc with Output=="-", Out routed to os.Stderr (so diagnostics never corrupt
+// the pipe), and Data left nil (download defaults the data sink to os.Stdout).
+func TestRunE_StdoutSingleURLWiring(t *testing.T) {
+	var captured download.Options
+	var calls int
+	stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+		calls++
+		captured = opts
+		return nil
+	})
+
+	cmd := NewRootCmd("v", "r", "d")
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"http://example.com/file.bin", "-o", "-"})
+	require.NoError(t, cmd.Execute())
+
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "-", captured.Output)
+	assert.Same(t, os.Stderr, captured.Out)
+	assert.Nil(t, captured.Data)
+}
+
 // ensure the command type is what callers expect.
 var _ *cobra.Command = NewRootCmd("", "", "")
