@@ -9,6 +9,7 @@ A reliable file downloader with durable resume, parallel segmented downloading, 
 - **Durable resume**: Per-chunk progress is persisted to a sidecar and resumed via HTTP Range
 - **Live progress**: Speed, transferred/total, and ETA, rendered only on a TTY
 - **Integrity**: Final size check plus optional sha256 verification
+- **Mirror failover**: Pass `-m/--mirror` alternates for one file; `dr` fails over in order and even resumes the partial across mirrors
 - **Flexible**: HTTP/HTTPS, custom output paths, custom headers, and a quiet mode for scripting
 
 ## Installation
@@ -49,6 +50,9 @@ dr https://example.com/a.zip https://example.com/b.zip -o ~/Downloads
 # Download every URL listed in a file (one per line; # comments allowed)
 dr -i urls.txt -o ~/Downloads
 
+# Mirror failover: try the primary, then each mirror in order, for ONE file
+dr https://a.example/file.iso -m https://b.example/file.iso -m https://c.example/file.iso -o file.iso
+
 # Verify integrity with sha256
 dr https://example.com/file.zip --checksum sha256:<hex>
 
@@ -76,6 +80,7 @@ Usage: dr <url> [flags]
       --timeout duration     per-request HTTP timeout (0 = none) (default 30s)
       --retries int          per-chunk retry attempts (default 3)
   -H, --header stringArray   extra request header "Key: Value" (repeatable)
+  -m, --mirror stringArray   alternate URL serving the SAME file; tried in order if the primary fails (repeatable; one URL only)
       --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)
       --proxy string         route through proxy URL (http/https/socks5/socks5h); when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored
   -q, --quiet                suppress progress output
@@ -162,6 +167,50 @@ its `Content-Disposition`/URL inside it) and `--checksum` is not allowed. The
 batch is *continue-on-error*: every URL is attempted, a summary is printed at the
 end (`dr: N of M downloads succeeded`, plus a line per failure), and `dr` exits
 non-zero if any download failed.
+
+## Mirror failover
+
+`-m/--mirror <url>` (repeatable) supplies alternate URLs that serve the **same
+file** as the primary positional URL. `dr` tries the primary first, then each
+mirror in order, and the download succeeds as soon as any source delivers a
+complete, verified file:
+
+```shell
+dr https://a.example/file.iso \
+   -m https://b.example/file.iso \
+   -m https://c.example/file.iso \
+   -o file.iso
+```
+
+Key behavior:
+
+- **One file only.** `--mirror` requires exactly one positional URL; it cannot be
+  combined with batch mode (multiple positional URLs or `-i/--input-file`). Each
+  mirror must be a valid `http`/`https` URL.
+- **Resume across mirrors.** Failover reuses the same `<output>.part` staging file
+  and resume sidecar. When the next mirror reports the same size *and* validator
+  (`ETag`/`Last-Modified`) as the partial on disk, `dr` **resumes** from where the
+  previous source left off instead of restarting. When the mirror's size/validator
+  differs, the partial is discarded and a **fresh** download starts from that
+  mirror.
+- **What triggers failover.** Any per-source failure advances to the next mirror:
+  a connection error, an HTTP 4xx/5xx, an exhausted-retry chunk failure, a size or
+  range mismatch, or a checksum mismatch. Only when **every** source is exhausted
+  does `dr` fail (reporting each source's error).
+- **Cancellation never burns a mirror.** Ctrl-C / `SIGTERM` (a context cancel or
+  timeout) aborts immediately without trying the next mirror; the `.part` and
+  sidecar are retained so a later run can resume.
+- **Checksum is a cross-mirror safety net.** `--checksum sha256:<hex>` is verified
+  on the final assembled file regardless of which mirror(s) served the bytes, so a
+  corrupt mirror is caught.
+- **Output naming is keyed on the primary.** The output filename (and the sidecar's
+  recorded URL) is derived from the primary URL, so failover never renames the
+  output mid-flight.
+- **stdout.** `-m` works with `-o -`, but a pipe cannot be rewound: failover only
+  happens *before* any byte is emitted (typically a probe/connect failure). Once a
+  source has written bytes to the pipe, a later error is returned rather than
+  replaying a mirror (which would duplicate the leading bytes). There is no resume
+  in stdout mode. `--checksum` with `-o -` remains rejected.
 
 ## Limiting bandwidth
 

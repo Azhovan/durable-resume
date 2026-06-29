@@ -932,5 +932,99 @@ func TestRunE_LimitRateBadValueFailsFast(t *testing.T) {
 	}
 }
 
+// TestRunEWiresMirrorsIntoOptions pins the --mirror/-m flag -> Options.Mirrors
+// wiring (order preserved) via the runFunc interception seam.
+func TestRunEWiresMirrorsIntoOptions(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantURL     string
+		wantMirrors []string
+	}{
+		{
+			name:        "no mirror flag",
+			args:        []string{"http://primary.example/file"},
+			wantURL:     "http://primary.example/file",
+			wantMirrors: nil,
+		},
+		{
+			name:        "single -m",
+			args:        []string{"http://primary.example/file", "-m", "http://b.example/file"},
+			wantURL:     "http://primary.example/file",
+			wantMirrors: []string{"http://b.example/file"},
+		},
+		{
+			name:        "repeatable --mirror in order",
+			args:        []string{"http://primary.example/file", "-m", "http://a.example/f", "-m", "http://b.example/f"},
+			wantURL:     "http://primary.example/file",
+			wantMirrors: []string{"http://a.example/f", "http://b.example/f"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var captured download.Options
+			var called bool
+			stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+				called = true
+				captured = opts
+				return nil
+			})
+
+			cmd := NewRootCmd("v", "r", "d")
+			cmd.SetArgs(tt.args)
+			require.NoError(t, cmd.Execute())
+
+			require.True(t, called, "runFunc must be invoked by RunE")
+			assert.Equal(t, tt.wantURL, captured.URL)
+			assert.Equal(t, tt.wantMirrors, captured.Mirrors)
+		})
+	}
+}
+
+// TestRunEMirrorRejections covers the invalid combinations: bad-scheme mirror,
+// --mirror with multiple positional URLs, and --mirror with -i (batch).
+func TestRunEMirrorRejections(t *testing.T) {
+	t.Run("bad scheme mirror", func(t *testing.T) {
+		stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+			t.Fatal("runFunc must not be invoked for a bad-scheme mirror")
+			return nil
+		})
+		cmd := NewRootCmd("v", "r", "d")
+		cmd.SetArgs([]string{"http://primary.example/file", "-m", "ftp://nope/x"})
+		err := cmd.Execute()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, download.ErrUnsupportedScheme)
+	})
+
+	t.Run("mirror with multiple positionals (batch)", func(t *testing.T) {
+		stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+			t.Fatal("runFunc must not be invoked when --mirror is combined with batch")
+			return nil
+		})
+		cmd := NewRootCmd("v", "r", "d")
+		cmd.SetArgs([]string{"http://a.example/f", "http://b.example/f", "-m", "http://c.example/f", "-o", t.TempDir()})
+		err := cmd.Execute()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--mirror requires exactly one URL")
+	})
+
+	t.Run("mirror with -i input file", func(t *testing.T) {
+		dir := t.TempDir()
+		listFile := filepath.Join(dir, "urls.txt")
+		require.NoError(t, os.WriteFile(listFile, []byte("http://a.example/f\nhttp://b.example/f\n"), 0o644))
+
+		stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+			t.Fatal("runFunc must not be invoked when --mirror is combined with -i")
+			return nil
+		})
+		cmd := NewRootCmd("v", "r", "d")
+		cmd.SetArgs([]string{"-i", listFile, "-m", "http://c.example/f", "-o", dir})
+		err := cmd.Execute()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--mirror requires exactly one URL")
+	})
+}
+
 // ensure the command type is what callers expect.
 var _ *cobra.Command = NewRootCmd("", "", "")

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -22,8 +23,17 @@ func newRetry(maxRetries int, base time.Duration, rng func() float64) retryFunc 
 		maxRetries = 0
 	}
 	if rng == nil {
+		// One retryFunc is shared by all concurrent chunk workers of a download,
+		// so the default jitter source must be goroutine-safe: math/rand's *Rand
+		// is not. Guard it with a mutex. (An injected rng is the caller's
+		// responsibility and is used verbatim for deterministic tests.)
 		src := rand.New(rand.NewSource(time.Now().UnixNano()))
-		rng = src.Float64
+		var mu sync.Mutex
+		rng = func() float64 {
+			mu.Lock()
+			defer mu.Unlock()
+			return src.Float64()
+		}
 	}
 	return func(ctx context.Context, op func() error) error {
 		var err error

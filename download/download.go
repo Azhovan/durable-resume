@@ -9,6 +9,19 @@
 // file. On success the resume sidecar is removed; on failure or interruption the
 // .part file and its sidecar are retained so a later run can resume.
 //
+// Mirror failover (Phase 1, sequential): opts.URL is the PRIMARY source and
+// opts.Mirrors holds ordered alternates serving the SAME file. opts.sources()
+// yields [primary, mirrors...]. Run resolves the output path and checks
+// skip-if-complete ONCE from a single primary probe, then runs an OUTER
+// sequential-failover loop (runSources) that tries each source's whole-download
+// attempt in turn, reusing the SAME .part + sidecar. A mirror reporting the same
+// size + validator RESUMES the partial; a mismatching one discards and restarts
+// fresh from that mirror. A per-source (non-ctx) failure advances to the next
+// source; a ctx cancel/deadline aborts ALL sources immediately (never burns a
+// mirror). When every source is exhausted Run returns ErrAllSourcesFailed
+// wrapping the per-source errors via errors.Join. With NO mirrors the path is
+// byte-for-byte identical to a single-source download.
+//
 // All bytes are staged into a sibling "<output>.part" file (see partPath); the
 // segmented resume sidecar travels with it as "<output>.part.dr.json". The final
 // path opts.Output is touched exactly once, by an atomic same-directory
@@ -49,6 +62,13 @@ var (
 	ErrRangeNot206       = errors.New("download: server did not honor range request")
 	ErrChunkFailed       = errors.New("download: chunk failed after retries")
 
+	// ErrAllSourcesFailed is returned when every source (the primary plus all
+	// mirrors) failed for one file. It wraps the per-source errors via
+	// errors.Join, so errors.Is matches BOTH this sentinel and every wrapped
+	// per-source sentinel (ErrChunkFailed, ErrSizeMismatch, ...). A single-source
+	// download (no mirrors) returns its lone error UNWRAPPED instead.
+	ErrAllSourcesFailed = errors.New("download: all sources (primary + mirrors) failed")
+
 	// ErrInvalidProxy is returned for an unparseable proxy URL, an unsupported
 	// proxy scheme, or a proxy URL missing a host. Accepted schemes: http,
 	// https, socks5, socks5h. Callers/tests branch on it via errors.Is.
@@ -86,7 +106,15 @@ func (c Checksum) Empty() bool {
 
 // Options is the fully-resolved configuration for one download. cmd/ builds it.
 type Options struct {
-	URL         string
+	URL string // primary source
+
+	// Mirrors holds ordered alternate sources for the SAME file, tried in turn
+	// after the primary fails. Empty (the default) means today's single-source
+	// behavior. opts.URL stays the PRIMARY: it drives output-name resolution and
+	// the sidecar's State.URL so failover never renames the output or invalidates
+	// the resume sidecar.
+	Mirrors []string
+
 	Output      string        // raw user -o/--output value: "" (derive after probe), an existing directory (place derived name inside), or a normal path (verbatim). Run resolves it to the final path after probe.
 	Concurrency int           // parallel chunks; clamped to >=1 inside Run
 	Resume      bool          // false when --no-resume
@@ -120,20 +148,61 @@ type Options struct {
 	clk clock
 }
 
+// sources returns the ordered source list: the primary (opts.URL) first, then the
+// mirrors in order. With no mirrors this is exactly []string{opts.URL}, so the
+// single-source path is byte-for-byte unchanged. Empty mirror entries are skipped
+// defensively.
+func (o Options) sources() []string {
+	srcs := make([]string, 0, 1+len(o.Mirrors))
+	srcs = append(srcs, o.URL)
+	for _, m := range o.Mirrors {
+		if m != "" {
+			srcs = append(srcs, m)
+		}
+	}
+	return srcs
+}
+
+// ctxCanceled reports a real ctx cancellation/deadline on the context itself
+// (never a failover trigger).
+func ctxCanceled(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+// isCtxErr reports whether err is (or wraps) a ctx cancel/deadline; used to
+// distinguish "abort all sources" from "advance to the next source".
+func isCtxErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // Run executes the download to completion or returns the first fatal error.
 // It honors ctx cancellation, flushes resume state on interrupt, removes the
 // sidecar on success, and retains the sidecar + partial file on failure.
+//
+// With mirrors configured (opts.Mirrors), Run resolves the output path and checks
+// skip-if-complete ONCE from a single primary probe, then runs a sequential
+// failover loop over opts.sources(). See the package comment for the failover
+// rules. With no mirrors the behavior is identical to a single-source download.
 func Run(ctx context.Context, opts Options) error {
 	if opts.URL == "" {
 		return ErrNoURL
 	}
+	// Validate the primary AND every mirror scheme up front: Run is public API and
+	// must stand alone (cmd validates too, but the engine cannot rely on that).
 	if err := validateScheme(opts.URL); err != nil {
 		return err
 	}
+	for _, m := range opts.Mirrors {
+		if m == "" {
+			continue
+		}
+		if err := validateScheme(m); err != nil {
+			return err
+		}
+	}
 
-	concurrency := opts.Concurrency
-	if concurrency < 1 {
-		concurrency = 1
+	if opts.Concurrency < 1 {
+		opts.Concurrency = 1
 	}
 
 	client, err := httpClient(opts)
@@ -142,48 +211,73 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	// Build ONE shared rate limiter for this download (nil when unlimited -> a
-	// true no-op). The SAME instance is threaded into every strategy and every
-	// concurrent chunk worker so the cap is an AGGREGATE whole-download cap, not
-	// a per-chunk cap.
+	// true no-op). The SAME instance is threaded into every source attempt and
+	// every concurrent chunk worker so the cap is an AGGREGATE whole-download cap,
+	// not a per-chunk or per-source cap.
 	lim := newRateLimiter(opts.LimitRate, opts.clk) // nil clk => realClock; nil result when unlimited
 	if lim != nil {
 		vlogf(opts, "rate: limiting to %d B/s (aggregate)", opts.LimitRate)
 	}
 
-	// 1. PROBE
-	info, err := probe(ctx, client, opts.URL, opts.Header)
-	if err != nil {
-		return fmt.Errorf("download: probe: %w", err)
-	}
-	vlogf(opts, "probe: size=%d acceptRanges=%t etag=%q lastModified=%q", info.size, info.acceptRanges, info.etag, info.lastModified)
-
 	// STDOUT MODE: a pipe is not seekable, cannot be stat'd, renamed, or resumed.
-	// Force a single sequential stream to the data sink and return BEFORE any
-	// resolveOutputPath / skip-if-complete / .part / rename / sidecar / strategy.
-	// The cmd layer routes opts.Out to stderr here so diagnostics never corrupt the
-	// piped payload, and rejects --checksum + multi-URL with "-" before we are even
-	// reached. Nothing was saved to a path, so no savedf is emitted.
+	// Sequential failover with NO resume across mirrors; handled fully here before
+	// any resolve/skip/.part work. The cmd layer routes opts.Out to stderr so
+	// diagnostics never corrupt the piped payload, and rejects --checksum + "-".
 	if stdoutMode(opts) {
-		vlogf(opts, "strategy: single sequential stream to stdout (forced; pipe not seekable; no .part/resume/rename)")
-		return runStdoutStream(ctx, client, opts, info, lim)
+		return runStdoutSources(ctx, client, opts, lim)
 	}
+
+	// 1. PROBE the PRIMARY once, to resolve the output name and check
+	// skip-if-complete BEFORE trying any source. This keeps the output naming +
+	// State.URL keyed on the primary so failover never renames the output.
+	primaryInfo, perr := probe(ctx, client, opts.URL, opts.Header)
+	if perr != nil {
+		// A real cancel/deadline aborts immediately, even on the primary probe.
+		if ctxCanceled(ctx) {
+			return ctx.Err()
+		}
+		// A primary probe transport failure must NOT be fatal when mirrors are
+		// present: resolve the name from the raw primary URL (resolveOutputPath
+		// tolerates a -1 size remoteInfo) and enter the loop, which re-probes the
+		// primary as source[0] and aggregates its error alongside the mirrors.
+		if len(opts.sources()) == 1 {
+			return fmt.Errorf("download: probe: %w", perr)
+		}
+		resolved, rerr := resolveOutputPath(opts.Output, remoteInfo{size: -1}, opts.URL)
+		if rerr != nil {
+			return fmt.Errorf("download: resolve output path: %w", rerr)
+		}
+		opts.Output = resolved
+		// Skip-if-complete is best-effort here: with the primary unreachable there is
+		// no probed size to compare, so only a matching --checksum can prove the
+		// existing final file is complete. When it does, skip before probing any
+		// mirror; otherwise fall through to failover. (Without --checksum,
+		// alreadyComplete on a -1 size always returns false, so this is a no-op.)
+		if skip, why := alreadyComplete(opts, remoteInfo{size: -1}); skip {
+			vlogf(opts, "skip: %s (primary unreachable)", why)
+			skippedf(opts)
+			return nil
+		}
+		vlogf(opts, "probe: primary failed (%v); resolved %q from URL and entering failover", perr, resolved)
+		return runSources(ctx, client, opts, lim, nil) // nil => source[0] self-probes
+	}
+	vlogf(opts, "probe: size=%d acceptRanges=%t etag=%q lastModified=%q", primaryInfo.size, primaryInfo.acceptRanges, primaryInfo.etag, primaryInfo.lastModified)
 
 	// 2. RESOLVE OUTPUT PATH (single source of truth; uses Content-Disposition and
-	// the post-redirect final URL captured by the probe). opts is a value copy
-	// local to Run; mutating opts.Output makes statePath/dest-open/resume/verify
-	// all consistent on the resolved path.
-	resolved, err := resolveOutputPath(opts.Output, info, opts.URL)
+	// the post-redirect final URL captured by the primary probe). opts is a value
+	// copy local to Run; mutating opts.Output makes statePath/dest-open/resume/
+	// verify all consistent on the resolved path for EVERY source attempt.
+	resolved, err := resolveOutputPath(opts.Output, primaryInfo, opts.URL)
 	if err != nil {
 		return fmt.Errorf("download: resolve output path: %w", err)
 	}
 	opts.Output = resolved
-	vlogf(opts, "output: resolved %q (cd=%q finalURL=%q)", resolved, info.contentDisposition, info.finalURL)
+	vlogf(opts, "output: resolved %q (cd=%q finalURL=%q)", resolved, primaryInfo.contentDisposition, primaryInfo.finalURL)
 
-	// 2b. SKIP-IF-COMPLETE: when the final file already exists and is verifiably
-	// complete (and --force is not set), short-circuit with no body fetch. Uses the
-	// resolved final path and the probed size; never touches/creates a .part or
-	// sidecar, so resume semantics are untouched.
-	if skip, why := alreadyComplete(opts, info); skip {
+	// 2b. SKIP-IF-COMPLETE once, before trying ANY source: when the final file
+	// already exists and is verifiably complete (and --force is not set),
+	// short-circuit with no body fetch. Never touches/creates a .part or sidecar.
+	if skip, why := alreadyComplete(opts, primaryInfo); skip {
 		vlogf(opts, "skip: %s", why)
 		skippedf(opts)
 		return nil
@@ -191,21 +285,133 @@ func Run(ctx context.Context, opts Options) error {
 		vlogf(opts, "skip: not skipping (%s)", why)
 	}
 
-	// 3. STRATEGY
-	if !info.streamable() {
-		vlogf(opts, "strategy: single sequential stream (no ranges or unknown size)")
-		if err := runSingleStream(ctx, client, opts, info, lim); err != nil {
-			return err
+	// 3. SEQUENTIAL FAILOVER over the source list, reusing the primary probe for
+	// source[0] to avoid a duplicate request.
+	return runSources(ctx, client, opts, lim, &primaryInfo)
+}
+
+// runSources is the OUTER sequential-failover loop for the file path. primaryInfo,
+// when non-nil, is reused for source[0] (avoids a duplicate probe). A per-source
+// (non-ctx) failure advances to the next source; a ctx cancel/deadline aborts all
+// sources. On every per-source failure the .part + sidecar are RETAINED (attempt /
+// the strategies never Remove on failure), so the next source can resume.
+//
+// Single-source (no mirrors): the loop runs once and returns the lone error
+// UNWRAPPED on failure, identical to today. Multi-source: an exhausted list
+// returns ErrAllSourcesFailed wrapping the per-source errors via errors.Join.
+func runSources(ctx context.Context, client *http.Client, opts Options, lim rateLimiter, primaryInfo *remoteInfo) error {
+	srcs := opts.sources()
+	multi := len(srcs) > 1
+	// Single-source returns its lone error UNWRAPPED (identical to today), so keep
+	// the raw error separate from the prefixed/aggregated multi-source list.
+	if !multi {
+		err := attempt(ctx, client, opts, srcs[0], primaryInfo, false, lim)
+		if err == nil {
+			savedf(opts)
 		}
-		savedf(opts)
-		return nil
-	}
-	vlogf(opts, "strategy: segmented download with concurrency=%d", concurrency)
-	if err := runSegmentedDownload(ctx, client, opts, info, concurrency, lim); err != nil {
 		return err
 	}
-	savedf(opts)
-	return nil
+	var errs []error
+	for i, src := range srcs {
+		if ctxCanceled(ctx) {
+			return ctx.Err()
+		}
+		var reuse *remoteInfo
+		if i == 0 {
+			reuse = primaryInfo // nil if the primary probe failed in Run
+		}
+		err := attempt(ctx, client, opts, src, reuse, multi, lim)
+		if err == nil {
+			savedf(opts)
+			return nil
+		}
+		// A cancel/deadline never burns the next mirror: abort all sources.
+		if ctxCanceled(ctx) || isCtxErr(err) {
+			return err
+		}
+		errs = append(errs, fmt.Errorf("source %d (%s): %w", i+1, src, err))
+		if i < len(srcs)-1 {
+			vlogf(opts, "mirror: source %d (%s) failed (%v); trying next", i+1, src, err)
+		}
+	}
+	// errors.Join lets errors.Is match BOTH ErrAllSourcesFailed and every wrapped
+	// per-source sentinel (ErrChunkFailed, ErrSizeMismatch, ErrChecksumMismatch, ...).
+	return fmt.Errorf("%w: %w", ErrAllSourcesFailed, errors.Join(errs...))
+}
+
+// attempt is the post-skip whole-download body for ONE source: probe-or-reuse,
+// then dispatch the strategy (segmented or single stream) against `source`. The
+// output is already resolved and skip-if-complete already ran, so it does NEITHER.
+// It does NOT emit savedf (the caller does, on overall success), and it RETAINS the
+// .part + sidecar on failure so the next source can resume. `multi` is threaded
+// into the segmented strategy so the resume-gate mismatch branch can
+// discard-and-restart instead of returning ErrRemoteChanged when more than one
+// source exists.
+func attempt(ctx context.Context, client *http.Client, opts Options, source string, reuse *remoteInfo, multi bool, lim rateLimiter) error {
+	info := remoteInfo{}
+	if reuse != nil {
+		info = *reuse
+	} else {
+		probed, err := probe(ctx, client, source, opts.Header)
+		if err != nil {
+			return fmt.Errorf("download: probe: %w", err) // transport error advances
+		}
+		info = probed
+		vlogf(opts, "probe: source=%s size=%d acceptRanges=%t etag=%q lastModified=%q", source, info.size, info.acceptRanges, info.etag, info.lastModified)
+	}
+
+	if !info.streamable() {
+		vlogf(opts, "strategy: single sequential stream (no ranges or unknown size)")
+		return runSingleStream(ctx, client, opts, info, lim, source)
+	}
+	vlogf(opts, "strategy: segmented download with concurrency=%d", opts.Concurrency)
+	return runSegmentedDownload(ctx, client, opts, info, opts.Concurrency, lim, source, multi)
+}
+
+// runStdoutSources performs sequential failover to the data sink (stdout) with NO
+// resume across mirrors. CRITICAL nuance: a pipe cannot be rewound, so we may only
+// fail over BEFORE any byte is emitted. runStdoutStream returns the bytes written
+// even on error; if a source emitted >0 bytes then failed, returning to a fresh
+// mirror would duplicate the leading bytes on the consumer's stream, so we DO NOT
+// fail over once bytes have been emitted — we return the error. (In practice probe
+// failures emit 0 bytes and fail over cleanly; a mid-stream death after bytes is
+// fatal, matching the existing "invoked at most once" stdout invariant.) No
+// .part/sidecar/rename is ever touched, so no savedf is emitted.
+func runStdoutSources(ctx context.Context, client *http.Client, opts Options, lim rateLimiter) error {
+	srcs := opts.sources()
+	var errs []error
+	for i, src := range srcs {
+		if ctxCanceled(ctx) {
+			return ctx.Err()
+		}
+		info, err := probe(ctx, client, src, opts.Header)
+		var emitted int64
+		if err == nil {
+			vlogf(opts, "strategy: single sequential stream to stdout (source=%s; no .part/resume/rename)", src)
+			emitted, err = runStdoutStream(ctx, client, opts, info, lim, src)
+		}
+		if err == nil {
+			return nil // nothing saved to a path; no savedf
+		}
+		if ctxCanceled(ctx) || isCtxErr(err) {
+			return err
+		}
+		// Single-source returns its lone error UNWRAPPED (no "source 1 (url):"
+		// prefix), matching the file path's runSources convention so a single-source
+		// stdout failure reads identically to pre-mirror behavior.
+		if len(srcs) == 1 {
+			return err
+		}
+		errs = append(errs, fmt.Errorf("source %d (%s): %w", i+1, src, err))
+		if emitted > 0 {
+			// Bytes already on the wire: failover would corrupt the stream. Stop.
+			return fmt.Errorf("%w: %w", ErrAllSourcesFailed, errors.Join(errs...))
+		}
+		if i < len(srcs)-1 {
+			vlogf(opts, "mirror: stdout source %d (%s) failed (%v); trying next", i+1, src, err)
+		}
+	}
+	return fmt.Errorf("%w: %w", ErrAllSourcesFailed, errors.Join(errs...))
 }
 
 // savedf prints "dr: saved to <path>" to opts.Out unless --quiet (independent of
@@ -243,7 +449,9 @@ func skippedf(opts Options) {
 // still a normal single request. Size is verified by COUNTING the bytes copied
 // against the probed size when known (>0); a shortfall is reported as ErrSizeMismatch
 // even though bytes were already emitted, so a pipeline gets a non-zero exit.
-func runStdoutStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo, lim rateLimiter) error {
+// It RETURNS the number of bytes emitted so runStdoutSources can decide whether
+// failover is still safe (only while emitted==0).
+func runStdoutStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo, lim rateLimiter, source string) (int64, error) {
 	dst := dataSink(opts)
 
 	prog := NewProgress(info.size, opts.Out, opts.Quiet) // opts.Out is stderr here
@@ -252,20 +460,20 @@ func runStdoutStream(ctx context.Context, client *http.Client, opts Options, inf
 
 	onBytes := func(n int64) { prog.Add(n) }
 
-	n, err := copyToStream(ctx, client, opts.URL, opts.Header, dst, onBytes, lim)
+	n, err := copyToStream(ctx, client, source, opts.Header, dst, onBytes, lim)
 	if err != nil {
-		return err
+		return n, err
 	}
 	if info.size > 0 && n != info.size {
-		return fmt.Errorf("download: streamed %d to stdout, want %d: %w", n, info.size, ErrSizeMismatch)
+		return n, fmt.Errorf("download: streamed %d to stdout, want %d: %w", n, info.size, ErrSizeMismatch)
 	}
-	return nil
+	return n, nil
 }
 
 // runSingleStream handles the non-streamable path: a single sequential stream
 // into the destination with no resume state and no size verification when the
 // size is unknown.
-func runSingleStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo, lim rateLimiter) error {
+func runSingleStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo, lim rateLimiter, source string) error {
 	// Stage into <output>.part; rename onto the final path only after verification.
 	// runSingle truncates dst to 0 on every attempt, so any pre-existing (stale)
 	// .part is overwritten; opts.Output is never touched before the atomic rename.
@@ -296,7 +504,7 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	retry := newRetry(opts.MaxRetries, 1*time.Millisecond, nil)
 	err = retry(ctx, func() error {
 		prog.Seed(0)
-		_, runErr := runSingle(ctx, client, opts.URL, opts.Header, dst, onBytes, lim)
+		_, runErr := runSingle(ctx, client, source, opts.Header, dst, onBytes, lim)
 		return runErr
 	})
 	if err != nil {
@@ -320,13 +528,20 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	if err := os.Rename(part, opts.Output); err != nil {
 		return fmt.Errorf("download: finalize output: %w", err)
 	}
+	// The single-stream path writes no sidecar of its own, but a PRIOR segmented
+	// attempt (e.g. a streamable primary that failed before failing over to this
+	// non-streamable mirror) may have left one beside the .part. Best-effort remove
+	// it so a fully successful download leaves no orphan sidecar. Harmless if absent;
+	// State.Remove ignores os.ErrNotExist. (An orphan is never unsafe — partialFileUsable
+	// fails once the .part is renamed away — but it is undesirable hygiene.)
+	_ = (&State{}).Remove(statePath(part))
 	return nil
 }
 
 // runSegmentedDownload handles the streamable path: plan chunks (honoring resume
 // state), pre-allocate or reopen the destination, run the bounded worker pool,
 // then verify and clean up.
-func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options, info remoteInfo, concurrency int, lim rateLimiter) error {
+func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options, info remoteInfo, concurrency int, lim rateLimiter, source string, multi bool) error {
 	// Stage into <output>.part; the sidecar travels with it at statePath(part) ==
 	// <output>.part.dr.json. On success: verify, close, rename .part -> final, THEN
 	// remove the sidecar (order matters; see the rename-failure handling below).
@@ -347,6 +562,15 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 		if saved != nil {
 			switch {
 			case !saved.Matches(info):
+				// MISMATCH. Single-source keeps today's fatal ErrRemoteChanged
+				// (the only behavioral branch keyed on source count). Multi-source
+				// DISCARDS the sidecar and restarts fresh from THIS mirror, since a
+				// different mirror legitimately may not match the partial.
+				if multi {
+					vlogf(opts, "resume: mirror does not match sidecar (size/validator); discarding and starting fresh from this source")
+					saved = nil
+					break
+				}
 				// Distinguish "remote changed (size)" from "remote changed
 				// (validator)" from "no usable validator". Check size first so a
 				// pure size change is not misreported as an ETag mismatch.
@@ -415,7 +639,7 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 
 	// 6. DOWNLOAD via bounded worker pool.
 	retry := newRetry(opts.MaxRetries, 1*time.Millisecond, nil)
-	dlErr := runSegmented(ctx, client, opts.URL, opts.Header, dst, st, sp, chunks, concurrency, onBytes, retry, lim)
+	dlErr := runSegmented(ctx, client, source, opts.Header, dst, st, sp, chunks, concurrency, onBytes, retry, lim)
 	if dlErr != nil {
 		// 7. INTERRUPT / failure: retain sidecar + partial file. Pool already
 		// flushed state on exit; nothing to remove.

@@ -1,7 +1,9 @@
 // Package cmd wires the `dr [flags] [url...]` command-line interface onto the
 // download package. It accepts one or more URLs (positional args and/or a list
 // read from -i/--input-file), parses flags into download.Options, installs
-// SIGINT/SIGTERM handling, and invokes download.Run once per URL.
+// SIGINT/SIGTERM handling, and invokes download.Run once per URL. A repeatable
+// --mirror/-m flag supplies alternate sources for a single file (sequential
+// failover); it requires exactly one positional URL and is rejected in batch mode.
 package cmd
 
 import (
@@ -61,6 +63,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 		force       bool
 		limitRate   string
 		proxy       string
+		mirrors     []string
 	)
 
 	cmd := &cobra.Command{
@@ -102,6 +105,18 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				return errNoURLs
 			}
 
+			// Mirrors are alternate sources for ONE file, so they require exactly
+			// one URL: they cannot be combined with batch mode (multiple positional
+			// URLs or -i). Validate each as http/https before any download starts.
+			if len(mirrors) > 0 && len(urls) != 1 {
+				return fmt.Errorf("--mirror requires exactly one URL (got %d); mirrors are alternate sources for ONE file and cannot be combined with batch mode (-i / multiple URLs)", len(urls))
+			}
+			for _, m := range mirrors {
+				if err := validateURL(m); err != nil {
+					return fmt.Errorf("invalid --mirror %q: %w", m, err)
+				}
+			}
+
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
@@ -140,6 +155,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 					base.Out = os.Stderr
 				}
 				base.URL = urls[0]
+				base.Mirrors = mirrors // alternate sources for this one file (file or stdout)
 				return runFunc(ctx, base)
 			}
 
@@ -184,6 +200,8 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 	flags.StringVar(&proxy, "proxy", "",
 		"route through proxy URL (http/https/socks5/socks5h); "+
 			"when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored")
+	flags.StringArrayVarP(&mirrors, "mirror", "m", nil,
+		`alternate URL serving the SAME file; tried in order if the primary fails (repeatable). Only valid with exactly one positional URL.`)
 
 	return cmd
 }
