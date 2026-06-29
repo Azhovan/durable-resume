@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -141,6 +142,15 @@ type Options struct {
 
 	LimitRate int64 // aggregate bytes/sec cap across all workers for THIS download; 0 = unlimited
 
+	// Result is an OPTIONAL output seam: when non-nil, Run populates it with the
+	// structured outcome (resolved path, bytes, size, sha256, resumed, skipped,
+	// source) on BOTH success and failure paths, for the cmd layer's --json
+	// rendering. nil (the production default and every existing test) => Run never
+	// touches it and behaves identically. Filled best-effort even on error so cmd
+	// can emit a failure record carrying whatever facts were learned. A pointer
+	// (not a return value) keeps Run's signature stable and mirrors Out/Data/clk.
+	Result *Result
+
 	// clk is an UNEXPORTED test seam: it overrides the rate limiter's clock so a
 	// same-package test can assert the COMPUTED throttle delay deterministically
 	// (no real sleeping) and prove the limiter is shared/aggregate across workers.
@@ -175,6 +185,18 @@ func isCtxErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// setResult is the single guarded mutation helper for Options.Result: when
+// Result is nil (the human path and every existing test) it is a no-op, so the
+// non-json behavior is provably side-effect-free. opts is passed by value but
+// Result is a pointer, so mutations through it are visible to the caller (cmd)
+// that supplied &res.
+func setResult(opts Options, mutate func(*Result)) {
+	if opts.Result == nil {
+		return
+	}
+	mutate(opts.Result)
+}
+
 // Run executes the download to completion or returns the first fatal error.
 // It honors ctx cancellation, flushes resume state on interrupt, removes the
 // sidecar on success, and retains the sidecar + partial file on failure.
@@ -204,6 +226,13 @@ func Run(ctx context.Context, opts Options) error {
 	if opts.Concurrency < 1 {
 		opts.Concurrency = 1
 	}
+
+	// Seed the always-known fields + unknown-size default so even an early-failure
+	// record is well-formed (valid url, size present as -1 until probed).
+	setResult(opts, func(r *Result) {
+		r.URL = opts.URL
+		r.Size = -1
+	})
 
 	client, err := httpClient(opts)
 	if err != nil {
@@ -248,6 +277,7 @@ func Run(ctx context.Context, opts Options) error {
 			return fmt.Errorf("download: resolve output path: %w", rerr)
 		}
 		opts.Output = resolved
+		setResult(opts, func(r *Result) { r.Output = opts.Output })
 		// Skip-if-complete is best-effort here: with the primary unreachable there is
 		// no probed size to compare, so only a matching --checksum can prove the
 		// existing final file is complete. When it does, skip before probing any
@@ -255,6 +285,12 @@ func Run(ctx context.Context, opts Options) error {
 		// alreadyComplete on a -1 size always returns false, so this is a no-op.)
 		if skip, why := alreadyComplete(opts, remoteInfo{size: -1}); skip {
 			vlogf(opts, "skip: %s (primary unreachable)", why)
+			setResult(opts, func(r *Result) {
+				r.Skipped = true
+				if fi, e := os.Stat(opts.Output); e == nil {
+					r.Bytes = fi.Size()
+				}
+			})
 			skippedf(opts)
 			return nil
 		}
@@ -272,6 +308,10 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("download: resolve output path: %w", err)
 	}
 	opts.Output = resolved
+	setResult(opts, func(r *Result) {
+		r.Output = opts.Output
+		r.Size = primaryInfo.size
+	})
 	vlogf(opts, "output: resolved %q (cd=%q finalURL=%q)", resolved, primaryInfo.contentDisposition, primaryInfo.finalURL)
 
 	// 2b. SKIP-IF-COMPLETE once, before trying ANY source: when the final file
@@ -279,6 +319,12 @@ func Run(ctx context.Context, opts Options) error {
 	// short-circuit with no body fetch. Never touches/creates a .part or sidecar.
 	if skip, why := alreadyComplete(opts, primaryInfo); skip {
 		vlogf(opts, "skip: %s", why)
+		setResult(opts, func(r *Result) {
+			r.Skipped = true
+			if fi, e := os.Stat(opts.Output); e == nil {
+				r.Bytes = fi.Size()
+			}
+		})
 		skippedf(opts)
 		return nil
 	} else {
@@ -307,6 +353,11 @@ func runSources(ctx context.Context, client *http.Client, opts Options, lim rate
 	if !multi {
 		err := attempt(ctx, client, opts, srcs[0], primaryInfo, false, lim)
 		if err == nil {
+			setResult(opts, func(r *Result) {
+				if r.Source == "" {
+					r.Source = srcs[0]
+				}
+			})
 			savedf(opts)
 		}
 		return err
@@ -322,6 +373,11 @@ func runSources(ctx context.Context, client *http.Client, opts Options, lim rate
 		}
 		err := attempt(ctx, client, opts, src, reuse, multi, lim)
 		if err == nil {
+			setResult(opts, func(r *Result) {
+				if r.Source == "" {
+					r.Source = src
+				}
+			})
 			savedf(opts)
 			return nil
 		}
@@ -515,6 +571,14 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	if err := verifySize(dst, info.size); err != nil {
 		return err
 	}
+	// Record actual bytes from the open file (Size may be -1 when unknown); the
+	// Stat must run while dst is still open, before the Close below nils it.
+	setResult(opts, func(r *Result) {
+		if fi, e := dst.Stat(); e == nil {
+			r.Bytes = fi.Size()
+		}
+		r.Size = info.size
+	})
 	if err := dst.Close(); err != nil {
 		return fmt.Errorf("download: close destination: %w", err)
 	}
@@ -522,6 +586,11 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	if err := verifyChecksum(part, opts.Checksum); err != nil {
 		return err
 	}
+	setResult(opts, func(r *Result) {
+		if !opts.Checksum.Empty() {
+			r.Sha256 = strings.ToLower(opts.Checksum.Hex)
+		}
+	})
 
 	// SUCCESS: atomic same-directory rename .part -> final. The only touch of
 	// opts.Output; on POSIX it overwrites any pre-existing file in one step.
@@ -594,6 +663,7 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 				st = saved
 				chunks = saved.toChunks()
 				resumed = true
+				setResult(opts, func(r *Result) { r.Resumed = resumed })
 				vlogf(opts, "resume: honoring sidecar; %d of %d bytes already complete", saved.completedBytes(), info.size)
 			}
 		}
@@ -660,6 +730,10 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 	if err := verifySize(dst, info.size); err != nil {
 		return err
 	}
+	setResult(opts, func(r *Result) {
+		r.Bytes = st.completedBytes()
+		r.Size = info.size
+	})
 	if err := dst.Close(); err != nil {
 		return fmt.Errorf("download: close destination: %w", err)
 	}
@@ -667,6 +741,11 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 	if err := verifyChecksum(part, opts.Checksum); err != nil {
 		return err
 	}
+	setResult(opts, func(r *Result) {
+		if !opts.Checksum.Empty() {
+			r.Sha256 = strings.ToLower(opts.Checksum.Hex)
+		}
+	})
 
 	// SUCCESS: atomic rename FIRST, then drop the sidecar. If the rename fails,
 	// return wrapped and KEEP the sidecar so the next run can retry/resume. (On

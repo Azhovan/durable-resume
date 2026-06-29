@@ -83,6 +83,7 @@ Usage: dr <url> [flags]
   -m, --mirror stringArray   alternate URL serving the SAME file; tried in order if the primary fails (repeatable). Only valid with exactly one positional URL.
       --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)
       --proxy string         route through proxy URL (http/https/socks5/socks5h); when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored
+      --json                 emit one machine-readable JSON object per download to stdout (NDJSON); implies --quiet and cannot be combined with -o -
   -q, --quiet                suppress progress output
   -v, --verbose              extra logging
       --version              version for dr
@@ -167,6 +168,53 @@ its `Content-Disposition`/URL inside it) and `--checksum` is not allowed. The
 batch is *continue-on-error*: every URL is attempted, a summary is printed at the
 end (`dr: N of M downloads succeeded`, plus a line per failure), and `dr` exits
 non-zero if any download failed.
+
+## Machine-readable output (`--json`)
+
+`--json` makes `dr` scriptable: instead of human progress and `dr: ...` lines, it
+emits **NDJSON** — one compact JSON object per line — to **stdout**. A single URL
+emits exactly one line; a batch emits one line per URL, streamed as each download
+completes (so a pipeline sees results incrementally and survives a mid-batch
+kill). `--json` is **opt-in**; without it the human output is unchanged.
+
+```shell
+# Print the URLs that failed in a batch
+dr --json -i urls.txt | jq -c 'select(.success | not) | .url'
+
+# Single download, inspect the verified digest
+dr --json --checksum sha256:<hex> -o file.iso https://example.com/file.iso | jq .
+```
+
+Each record carries:
+
+| field     | type   | notes                                                              |
+|-----------|--------|--------------------------------------------------------------------|
+| `url`     | string | the requested (primary) URL                                        |
+| `output`  | string | the resolved final path                                            |
+| `bytes`   | int    | bytes written to the destination                                   |
+| `size`    | int    | probed total size; `-1` when unknown                               |
+| `sha256`  | string | verified lowercase hex; present **only** with `--checksum`         |
+| `resumed` | bool   | a matching resume sidecar was honored                              |
+| `skipped` | bool   | skip-if-complete short-circuit hit (`success` is then `true`)      |
+| `source`  | string | the URL that actually served the bytes (a mirror after failover)   |
+| `success` | bool   | whether the download succeeded                                     |
+| `error`   | string | failure message; present **only** when `success` is `false`        |
+
+`size`, `bytes`, `resumed`, `skipped`, and `success` are always present;
+`sha256`, `source`, and `error` are omitted when empty.
+
+IO routing: in `--json` mode **stdout carries only the NDJSON records**. All
+human output (the progress bar and `dr: saved to`/`skipping`/verbose lines) is
+suppressed — `--json` implies `--quiet` — and any residual diagnostics go to
+stderr, so the JSON stream is never corrupted. Records are emitted for **both
+success and failure** — even an invalid URL yields a record with `success:false`
+and a non-empty `error` (no record is ever dropped); in a batch `dr` still exits
+non-zero if any URL failed (no human "N of M" tally is printed). `--json`
+**cannot be combined with `-o -`** (both write to stdout) and is rejected before
+any download starts. `--json` with `--quiet` is allowed and behaves like `--json`
+alone. The multi-URL guards apply identically under `--json`: with more than one
+URL, `-o` must name an existing **directory** and `--checksum` is rejected (one
+digest cannot validate many files).
 
 ## Mirror failover
 

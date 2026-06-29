@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +36,44 @@ var errNoURLs = fmt.Errorf("no URLs provided: %w", download.ErrNoURL)
 // itemizes each failure, and main prints this error verbatim, so a content-free
 // sentinel avoids a second, opposite-framed tally line.
 var errBatchFailed = errors.New("some downloads failed")
+
+// errJSONFailed drives a non-zero exit for a single-URL --json failure. Like
+// errBatchFailed it carries no user-facing detail: the emitted JSON record
+// already carries the real error, and main prints this sentinel to STDERR (never
+// stdout), so it keeps stdout pure NDJSON and the stderr line uninformative.
+var errJSONFailed = errors.New("download failed")
+
+// jsonRecord is the wire shape of one NDJSON line: the embedded download.Result
+// (flattened, snake_case) plus the cmd-owned success/error fields that Run
+// communicates via its returned error rather than the Result struct.
+type jsonRecord struct {
+	download.Result        // url, output, bytes, size, sha256, resumed, skipped, source
+	Success         bool   `json:"success"`
+	Error           string `json:"error,omitempty"`
+}
+
+// recordFor builds a record from a populated Result and the run error.
+func recordFor(res download.Result, err error) jsonRecord {
+	rec := jsonRecord{Result: res, Success: err == nil}
+	if err != nil {
+		rec.Error = err.Error()
+	}
+	return rec
+}
+
+// emitJSON marshals ONE compact object + '\n' to w (NDJSON). Compact (not
+// Indent) so each record is a single line for `jq -c`. A marshal error is
+// impossible for these flat scalar types but is handled defensively so the
+// stream stays parseable.
+func emitJSON(w io.Writer, rec jsonRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		b = []byte(fmt.Sprintf(`{"url":%q,"success":false,"error":"json marshal: %v"}`, rec.URL, err))
+	}
+	b = append(b, '\n')
+	_, werr := w.Write(b)
+	return werr
+}
 
 // runFunc is the download entry point invoked by RunE. It is a package-level var
 // (defaulting to download.Run) solely so tests can intercept the fully-built
@@ -64,6 +103,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 		limitRate   string
 		proxy       string
 		mirrors     []string
+		jsonOut     bool
 	)
 
 	cmd := &cobra.Command{
@@ -138,6 +178,98 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 
 			stdout := output == stdoutDash
 
+			// --json and -o - both own stdout; reject the combination before any
+			// download (mirrors the existing --checksum + "-" rejection).
+			if jsonOut && stdout {
+				return fmt.Errorf("--json cannot be used when writing to stdout (-o -); both write to stdout")
+			}
+			// --json implies Quiet-like suppression of ALL human emission plus stderr
+			// routing for any residual diagnostics, so the ONLY thing on stdout is the
+			// NDJSON stream (written by cmd, never by Run).
+			if jsonOut {
+				base.Quiet = true
+				base.Out = os.Stderr
+			}
+
+			// SINGLE URL --json: attach a Result, run, emit exactly one line, and
+			// translate failure into a non-zero exit without a competing human line.
+			// A URL validation failure is surfaced AS a JSON record (success=false +
+			// error), matching the batch path and requirement #3, rather than an early
+			// non-JSON return — so stdout always carries exactly one record.
+			if jsonOut && len(urls) == 1 {
+				var res download.Result
+				res.URL = urls[0]
+				res.Size = -1 // fallback so an early-failure record still parses
+				rerr := validateURL(urls[0])
+				if rerr == nil {
+					base.URL = urls[0]
+					base.Mirrors = mirrors
+					base.Result = &res
+					rerr = runFunc(ctx, base)
+				}
+				if werr := emitJSON(cmd.OutOrStdout(), recordFor(res, rerr)); werr != nil {
+					return werr
+				}
+				if rerr != nil {
+					return errJSONFailed
+				}
+				return nil
+			}
+
+			// MULTIPLE URLs: multi-only global guards shared by EVERY multi-URL path
+			// (json and non-json), applied before any download so --json cannot bypass
+			// them. A single pipe cannot disambiguate multiple bodies; one checksum
+			// cannot validate N files; a plain-file -o would collide all downloads onto
+			// one path.
+			if len(urls) > 1 {
+				if stdout {
+					return fmt.Errorf("-o - (stdout) cannot be used with multiple URLs")
+				}
+				if !sum.Empty() {
+					return fmt.Errorf("--checksum cannot be used with multiple URLs")
+				}
+				if output != "" && !isExistingDir(output) {
+					return fmt.Errorf("--output must be a directory when downloading multiple URLs: %q", output)
+				}
+			}
+
+			// BATCH --json: stream one NDJSON line per URL as each completes; suppress
+			// writeSummary; exit non-zero iff any failed. Own loop (do NOT reuse
+			// runBatch, which buffers) mirroring runBatch's ctx-cancel + validateURL
+			// continue-on-error structure. A fresh res per iteration prevents bleed.
+			if jsonOut {
+				anyFailed := false
+				for _, rawURL := range urls {
+					var res download.Result
+					res.URL = rawURL
+					res.Size = -1 // fallback so an early-failure record still parses with a valid url/size
+					var rerr error
+					switch {
+					case ctx.Err() != nil:
+						rerr = ctx.Err()
+					default:
+						if verr := validateURL(rawURL); verr != nil {
+							rerr = verr
+						} else {
+							opts := base
+							opts.URL = rawURL
+							opts.Result = &res
+							rerr = runFunc(ctx, opts)
+						}
+					}
+					if rerr != nil {
+						anyFailed = true
+					}
+					if werr := emitJSON(cmd.OutOrStdout(), recordFor(res, rerr)); werr != nil {
+						return werr
+					}
+				}
+				if anyFailed {
+					return errBatchFailed
+				}
+				return nil
+			}
+
 			// SINGLE URL: byte-for-byte unchanged behavior, except for stdout mode.
 			if len(urls) == 1 {
 				if err := validateURL(urls[0]); err != nil {
@@ -159,18 +291,8 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				return runFunc(ctx, base)
 			}
 
-			// MULTIPLE URLs: a single pipe cannot disambiguate multiple bodies.
-			if stdout {
-				return fmt.Errorf("-o - (stdout) cannot be used with multiple URLs")
-			}
-			// MULTIPLE URLs: multi-only global guards before any download.
-			if !sum.Empty() {
-				return fmt.Errorf("--checksum cannot be used with multiple URLs")
-			}
-			if output != "" && !isExistingDir(output) {
-				return fmt.Errorf("--output must be a directory when downloading multiple URLs: %q", output)
-			}
-
+			// MULTIPLE URLs (non-json): the shared multi-URL guards above already
+			// rejected stdout / checksum / non-directory output.
 			results := runBatch(ctx, urls, base)
 			if writeSummary(cmd.ErrOrStderr(), results) {
 				// The summary already itemized every failure on stderr; return a
@@ -202,6 +324,9 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 			"when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored")
 	flags.StringArrayVarP(&mirrors, "mirror", "m", nil,
 		`alternate URL serving the SAME file; tried in order if the primary fails (repeatable). Only valid with exactly one positional URL.`)
+	flags.BoolVar(&jsonOut, "json", false,
+		"emit one machine-readable JSON object per download to stdout (NDJSON); "+
+			"implies --quiet for human output and cannot be combined with -o -")
 
 	return cmd
 }
