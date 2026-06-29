@@ -40,6 +40,9 @@ dr https://example.com/file.zip --resume=false
 # Re-download even if the file already exists and is complete
 dr https://example.com/file.zip --force
 
+# Stream to stdout to pipe into another program
+dr https://example.com/archive.tar.gz -o - | tar xz
+
 # Download several files into a directory
 dr https://example.com/a.zip https://example.com/b.zip -o ~/Downloads
 
@@ -64,7 +67,7 @@ dr https://example.com/file.tar.gz --verbose
 ```
 Usage: dr <url> [flags]
 
-  -o, --output string        destination file or directory (default: Content-Disposition or URL name)
+  -o, --output string        destination file or directory, or - for stdout (default: Content-Disposition or URL name)
   -i, --input-file string    read URLs from a file, one per line (blank/# lines skipped; - = stdin)
   -c, --concurrency int      number of parallel chunks (default 4)
       --resume               resume a previous interrupted download (default true)
@@ -124,6 +127,22 @@ same-directory `os.Rename`). So the final path either does not exist yet or is a
 complete, verified file — an observer never sees a half-written or zero-holed
 file at the real name. On interruption or failure the `.part` is kept and the
 final path is left untouched.
+
+## Writing to stdout
+
+Use `-o -` to stream the downloaded body to standard output, so `dr` composes in
+shell pipelines:
+
+```shell
+dr https://example.com/archive.tar.gz -o - | tar xz
+dr https://example.com/data.json -o - | jq .
+```
+
+In this mode all progress and diagnostic output goes to stderr (never stdout, so
+the payload is never corrupted), and the download runs as a single sequential
+stream — `.part` staging, resume, and skip-if-complete don't apply to a pipe.
+Size is still verified against the server's `Content-Length` (a short stream
+exits non-zero). `--checksum` and multiple URLs cannot be combined with `-o -`.
 
 ## Batch downloads
 
