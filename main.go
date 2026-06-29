@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/azhovan/durable-resume/cmd"
+	"github.com/azhovan/durable-resume/v3/cmd"
 )
 
 // These are set via -ldflags at build time. Defaults are used for `go run`.

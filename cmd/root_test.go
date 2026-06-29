@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/azhovan/durable-resume/download"
+	"github.com/azhovan/durable-resume/v3/download"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

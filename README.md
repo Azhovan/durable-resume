@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/azhovan/durable-resume/actions/workflows/test.yml/badge.svg)](https://github.com/azhovan/durable-resume/actions/workflows/test.yml)
 ![Go 1.22+](https://img.shields.io/badge/go-1.22%2B-00ADD8)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A single-binary download manager (Go, stdlib-only) built around bulletproof resume: parallel segmented downloads, durable per-chunk resume, atomic output, and mirror failover — the resilience `curl`/`wget` lack, without `aria2`'s footprint. The binary is `dr`; there are no subcommands.
 
@@ -25,10 +26,10 @@ A single-binary download manager (Go, stdlib-only) built around bulletproof resu
 ## Install
 
 ```shell
-go install github.com/azhovan/durable-resume@v3.9.0
+go install github.com/azhovan/durable-resume/v3@latest
 ```
 
-> Note: use the pinned tag above, not `@latest`. The module path has no `/v3` suffix yet, so `@latest` resolves to an old `v0.x` tag rather than the current release. (Or build from source — see [Build & test](#build--test).)
+Or build from source — see [Build & test](#build--test).
 
 ## Quickstart
 
@@ -185,3 +186,7 @@ Not yet implemented:
 ## Contributing
 
 Contributions are welcome. Please open an issue or pull request.
+
+## License
+
+[MIT](LICENSE)

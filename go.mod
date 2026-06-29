@@ -1,4 +1,4 @@
-module github.com/azhovan/durable-resume
+module github.com/azhovan/durable-resume/v3
 
 go 1.22
 

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/azhovan/durable-resume/download"
+	"github.com/azhovan/durable-resume/v3/download"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
