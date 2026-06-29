@@ -19,7 +19,7 @@ type retryFunc func(ctx context.Context, op func() error) error
 // fatal error cancels remaining workers and is returned (wrapped with ErrChunkFailed
 // when it originates from a chunk fetch). WriteAt offsets are disjoint, so file
 // writes need no extra locking; State.mu guards only the State struct.
-func runSegmented(ctx context.Context, c *http.Client, url string, hdr http.Header, dst *os.File, st *State, statePath string, chunks []chunk, concurrency int, onBytes func(int64), retry retryFunc) error {
+func runSegmented(ctx context.Context, c *http.Client, url string, hdr http.Header, dst *os.File, st *State, statePath string, chunks []chunk, concurrency int, onBytes func(int64), retry retryFunc, lim rateLimiter) error {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -96,7 +96,7 @@ func runSegmented(ctx context.Context, c *http.Client, url string, hdr http.Head
 			}
 
 			err := retry(ctx, func() error {
-				return fetchChunk(ctx, c, url, hdr, ch, dst, onWrite)
+				return fetchChunk(ctx, c, url, hdr, ch, dst, onWrite, lim)
 			})
 			if err != nil {
 				fail(classifyChunkError(err))
@@ -136,7 +136,7 @@ func classifyChunkError(err error) error {
 // emission is returned as-is, and the caller (runStdoutStream) invokes it at most
 // once so emitted bytes are never duplicated. runSingle (the file path) is left
 // untouched.
-func copyToStream(ctx context.Context, c *http.Client, url string, hdr http.Header, w io.Writer, onBytes func(int64)) (int64, error) {
+func copyToStream(ctx context.Context, c *http.Client, url string, hdr http.Header, w io.Writer, onBytes func(int64), lim rateLimiter) (int64, error) {
 	// No range header: fetch the whole resource.
 	req, err := newRequest(ctx, url, hdr, -1, -1)
 	if err != nil {
@@ -163,6 +163,11 @@ func copyToStream(ctx context.Context, c *http.Client, url string, hdr http.Head
 		}
 		nr, rerr := resp.Body.Read(buf)
 		if nr > 0 {
+			// Throttle on the bytes just read, before the write; no-op when lim is
+			// nil. A cancel returns ctx.Err() and aborts the loop.
+			if werr := gate(ctx, lim, int64(nr)); werr != nil {
+				return total, werr
+			}
 			nw, werr := w.Write(buf[:nr])
 			if nw > 0 {
 				total += int64(nw)
@@ -190,7 +195,7 @@ func copyToStream(ctx context.Context, c *http.Client, url string, hdr http.Head
 
 // runSingle streams the whole resource into dst sequentially (truncates dst to 0
 // first; no ranges, no resume). Returns the number of bytes copied.
-func runSingle(ctx context.Context, c *http.Client, url string, hdr http.Header, dst *os.File, onBytes func(int64)) (int64, error) {
+func runSingle(ctx context.Context, c *http.Client, url string, hdr http.Header, dst *os.File, onBytes func(int64), lim rateLimiter) (int64, error) {
 	// No range header: fetch the whole resource.
 	req, err := newRequest(ctx, url, hdr, -1, -1)
 	if err != nil {
@@ -223,6 +228,11 @@ func runSingle(ctx context.Context, c *http.Client, url string, hdr http.Header,
 		}
 		nr, rerr := resp.Body.Read(buf)
 		if nr > 0 {
+			// Throttle on the bytes just read, before the write; no-op when lim is
+			// nil. A cancel returns ctx.Err() and aborts the loop.
+			if werr := gate(ctx, lim, int64(nr)); werr != nil {
+				return total, werr
+			}
 			nw, werr := dst.WriteAt(buf[:nr], off)
 			if nw > 0 {
 				off += int64(nw)

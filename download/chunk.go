@@ -70,7 +70,7 @@ func planChunks(size int64, concurrency int) []chunk {
 // successful write. Validates a 206 response (else ErrRangeNot206). Uses a fixed
 // copyBufferSize buffer, never a per-chunk buffer. Safe for concurrent use across
 // distinct chunks because WriteAt targets disjoint offsets.
-func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header, ch *chunk, w io.WriterAt, onBytes func(int64)) error {
+func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header, ch *chunk, w io.WriterAt, onBytes func(int64), lim rateLimiter) error {
 	offset, todo := ch.remaining()
 	if !todo {
 		return nil
@@ -108,6 +108,14 @@ func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header
 				// Protocol violation: the server returned more than the requested
 				// range. Refuse to write the surplus; fail fatally.
 				return fmt.Errorf("download: chunk %d over-length 206 response: %w", ch.index, ErrRangeNot206)
+			}
+			// Throttle on the bytes about to be written, BEFORE the WriteAt, so an
+			// aborted wait happens without a partial write past the cursor. gate is
+			// a no-op when lim is nil (unlimited). A cancel returns ctx.Err(), which
+			// classifyChunkError passes through unwrapped and isRetryable treats as
+			// fatal, so the chunk does not retry.
+			if werr := gate(ctx, lim, n); werr != nil {
+				return werr
 			}
 			// Absolute offset advances as ch.done advances.
 			at := ch.start + ch.done

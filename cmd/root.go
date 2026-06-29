@@ -59,6 +59,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 		quiet       bool
 		verbose     bool
 		force       bool
+		limitRate   string
 	)
 
 	cmd := &cobra.Command{
@@ -77,6 +78,12 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				return err
 			}
 			sum, err := parseChecksum(checksum)
+			if err != nil {
+				return err
+			}
+			// Parse the rate cap before assembling URLs so a bad value fails fast
+			// and no download (single, stdout, or batch) is ever started.
+			rate, err := parseRate(limitRate)
 			if err != nil {
 				return err
 			}
@@ -104,6 +111,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				Quiet:       quiet,
 				Verbose:     verbose,
 				Out:         os.Stdout,
+				LimitRate:   rate,
 			}
 
 			stdout := output == stdoutDash
@@ -164,6 +172,8 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 	flags.BoolVarP(&quiet, "quiet", "q", false, "suppress progress output")
 	flags.BoolVarP(&verbose, "verbose", "v", false, "extra logging")
 	flags.BoolVarP(&force, "force", "f", false, "re-download even if the destination already exists")
+	flags.StringVar(&limitRate, "limit-rate", "",
+		"limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)")
 
 	return cmd
 }

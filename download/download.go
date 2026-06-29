@@ -95,6 +95,13 @@ type Options struct {
 	Out         *os.File      // MESSAGE sink (progress/diag); normally os.Stdout, but cmd sets os.Stderr in stdout mode (injectable). Type stays *os.File for isTTY.
 	Data        io.Writer     // DATA sink for stdout mode (Output=="-"); nil means os.Stdout via dataSink. Decoupled from the *os.File message sink; injectable for tests.
 	Client      *http.Client  // injectable for tests; nil => default built from Timeout
+	LimitRate   int64         // aggregate bytes/sec cap across all workers for THIS download; 0 = unlimited
+
+	// clk is an UNEXPORTED test seam: it overrides the rate limiter's clock so a
+	// same-package test can assert the COMPUTED throttle delay deterministically
+	// (no real sleeping) and prove the limiter is shared/aggregate across workers.
+	// nil (the only value cmd can produce) => realClock, so production is unchanged.
+	clk clock
 }
 
 // Run executes the download to completion or returns the first fatal error.
@@ -115,6 +122,15 @@ func Run(ctx context.Context, opts Options) error {
 
 	client := httpClient(opts)
 
+	// Build ONE shared rate limiter for this download (nil when unlimited -> a
+	// true no-op). The SAME instance is threaded into every strategy and every
+	// concurrent chunk worker so the cap is an AGGREGATE whole-download cap, not
+	// a per-chunk cap.
+	lim := newRateLimiter(opts.LimitRate, opts.clk) // nil clk => realClock; nil result when unlimited
+	if lim != nil {
+		vlogf(opts, "rate: limiting to %d B/s (aggregate)", opts.LimitRate)
+	}
+
 	// 1. PROBE
 	info, err := probe(ctx, client, opts.URL, opts.Header)
 	if err != nil {
@@ -130,7 +146,7 @@ func Run(ctx context.Context, opts Options) error {
 	// reached. Nothing was saved to a path, so no savedf is emitted.
 	if stdoutMode(opts) {
 		vlogf(opts, "strategy: single sequential stream to stdout (forced; pipe not seekable; no .part/resume/rename)")
-		return runStdoutStream(ctx, client, opts, info)
+		return runStdoutStream(ctx, client, opts, info, lim)
 	}
 
 	// 2. RESOLVE OUTPUT PATH (single source of truth; uses Content-Disposition and
@@ -159,14 +175,14 @@ func Run(ctx context.Context, opts Options) error {
 	// 3. STRATEGY
 	if !info.streamable() {
 		vlogf(opts, "strategy: single sequential stream (no ranges or unknown size)")
-		if err := runSingleStream(ctx, client, opts, info); err != nil {
+		if err := runSingleStream(ctx, client, opts, info, lim); err != nil {
 			return err
 		}
 		savedf(opts)
 		return nil
 	}
 	vlogf(opts, "strategy: segmented download with concurrency=%d", concurrency)
-	if err := runSegmentedDownload(ctx, client, opts, info, concurrency); err != nil {
+	if err := runSegmentedDownload(ctx, client, opts, info, concurrency, lim); err != nil {
 		return err
 	}
 	savedf(opts)
@@ -208,7 +224,7 @@ func skippedf(opts Options) {
 // still a normal single request. Size is verified by COUNTING the bytes copied
 // against the probed size when known (>0); a shortfall is reported as ErrSizeMismatch
 // even though bytes were already emitted, so a pipeline gets a non-zero exit.
-func runStdoutStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo) error {
+func runStdoutStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo, lim rateLimiter) error {
 	dst := dataSink(opts)
 
 	prog := NewProgress(info.size, opts.Out, opts.Quiet) // opts.Out is stderr here
@@ -217,7 +233,7 @@ func runStdoutStream(ctx context.Context, client *http.Client, opts Options, inf
 
 	onBytes := func(n int64) { prog.Add(n) }
 
-	n, err := copyToStream(ctx, client, opts.URL, opts.Header, dst, onBytes)
+	n, err := copyToStream(ctx, client, opts.URL, opts.Header, dst, onBytes, lim)
 	if err != nil {
 		return err
 	}
@@ -230,7 +246,7 @@ func runStdoutStream(ctx context.Context, client *http.Client, opts Options, inf
 // runSingleStream handles the non-streamable path: a single sequential stream
 // into the destination with no resume state and no size verification when the
 // size is unknown.
-func runSingleStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo) error {
+func runSingleStream(ctx context.Context, client *http.Client, opts Options, info remoteInfo, lim rateLimiter) error {
 	// Stage into <output>.part; rename onto the final path only after verification.
 	// runSingle truncates dst to 0 on every attempt, so any pre-existing (stale)
 	// .part is overwritten; opts.Output is never touched before the atomic rename.
@@ -261,7 +277,7 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	retry := newRetry(opts.MaxRetries, 1*time.Millisecond, nil)
 	err = retry(ctx, func() error {
 		prog.Seed(0)
-		_, runErr := runSingle(ctx, client, opts.URL, opts.Header, dst, onBytes)
+		_, runErr := runSingle(ctx, client, opts.URL, opts.Header, dst, onBytes, lim)
 		return runErr
 	})
 	if err != nil {
@@ -291,7 +307,7 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 // runSegmentedDownload handles the streamable path: plan chunks (honoring resume
 // state), pre-allocate or reopen the destination, run the bounded worker pool,
 // then verify and clean up.
-func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options, info remoteInfo, concurrency int) error {
+func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options, info remoteInfo, concurrency int, lim rateLimiter) error {
 	// Stage into <output>.part; the sidecar travels with it at statePath(part) ==
 	// <output>.part.dr.json. On success: verify, close, rename .part -> final, THEN
 	// remove the sidecar (order matters; see the rename-failure handling below).
@@ -380,7 +396,7 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 
 	// 6. DOWNLOAD via bounded worker pool.
 	retry := newRetry(opts.MaxRetries, 1*time.Millisecond, nil)
-	dlErr := runSegmented(ctx, client, opts.URL, opts.Header, dst, st, sp, chunks, concurrency, onBytes, retry)
+	dlErr := runSegmented(ctx, client, opts.URL, opts.Header, dst, st, sp, chunks, concurrency, onBytes, retry, lim)
 	if dlErr != nil {
 		// 7. INTERRUPT / failure: retain sidecar + partial file. Pool already
 		// flushed state on exit; nothing to remove.

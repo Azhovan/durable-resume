@@ -772,5 +772,78 @@ func TestRunE_StdoutSingleURLWiring(t *testing.T) {
 	assert.Nil(t, captured.Data)
 }
 
+func TestNewRootCmdLimitRateFlag(t *testing.T) {
+	t.Parallel()
+	cmd := NewRootCmd("v", "r", "d")
+	f := cmd.Flags().Lookup("limit-rate")
+	require.NotNil(t, f, "limit-rate flag should be registered")
+	assert.Equal(t, "", f.DefValue)
+}
+
+// TestRunE_LimitRateWiring confirms a good --limit-rate value is parsed and wired
+// into download.Options.LimitRate (bytes/sec), via the runFunc capture seam.
+func TestRunE_LimitRateWiring(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want int64
+	}{
+		{name: "no flag unlimited", args: []string{"http://example.com/file.bin"}, want: 0},
+		{name: "500k", args: []string{"http://example.com/file.bin", "--limit-rate", "500k"}, want: 512000},
+		{name: "1M", args: []string{"http://example.com/file.bin", "--limit-rate", "1M"}, want: 1048576},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var captured download.Options
+			var called bool
+			stubRunFunc(t, func(_ context.Context, opts download.Options) error {
+				called = true
+				captured = opts
+				return nil
+			})
+
+			cmd := NewRootCmd("v", "r", "d")
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs(tt.args)
+			require.NoError(t, cmd.Execute())
+
+			require.True(t, called)
+			assert.Equal(t, tt.want, captured.LimitRate)
+		})
+	}
+}
+
+// TestRunE_LimitRateBadValueFailsFast confirms a malformed --limit-rate aborts
+// RunE before any download (runFunc is never called).
+func TestRunE_LimitRateBadValueFailsFast(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "unknown unit", args: []string{"http://a/x", "--limit-rate", "1X"}},
+		{name: "negative", args: []string{"http://a/x", "--limit-rate", "-5"}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int
+			stubRunFunc(t, func(_ context.Context, _ download.Options) error {
+				calls++
+				return nil
+			})
+
+			cmd := NewRootCmd("v", "r", "d")
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs(tt.args)
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Equal(t, 0, calls, "no download must start on a bad --limit-rate")
+		})
+	}
+}
+
 // ensure the command type is what callers expect.
 var _ *cobra.Command = NewRootCmd("", "", "")

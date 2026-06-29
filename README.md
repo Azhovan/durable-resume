@@ -76,6 +76,7 @@ Usage: dr <url> [flags]
       --timeout duration     per-request HTTP timeout (0 = none) (default 30s)
       --retries int          per-chunk retry attempts (default 3)
   -H, --header stringArray   extra request header "Key: Value" (repeatable)
+      --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (empty/0 = unlimited)
   -q, --quiet                suppress progress output
   -v, --verbose              extra logging
       --version              version for dr
@@ -161,6 +162,33 @@ batch is *continue-on-error*: every URL is attempted, a summary is printed at th
 end (`dr: N of M downloads succeeded`, plus a line per failure), and `dr` exits
 non-zero if any download failed.
 
+## Limiting bandwidth
+
+`--limit-rate <rate>` caps the download speed, like `wget --limit-rate` /
+`curl --limit-rate`. The cap is an **aggregate** whole-download cap across all
+`-c/--concurrency` workers (with `-c 4 --limit-rate 1M` the total is ~1 MiB/s,
+not 4 MiB/s), and it applies to every path: segmented, single-stream, and
+`-o -` stdout.
+
+The grammar is `<number><unit>`, case-insensitive, where the unit is one of:
+
+| Unit              | Meaning              | Example   | Bytes/sec  |
+| ----------------- | -------------------- | --------- | ---------- |
+| *(none)* or `b`   | bytes                | `100000`  | 100000     |
+| `k` / `K` / `kib` | KiB (1024 bytes)     | `500k`    | 512000     |
+| `m` / `M` / `mib` | MiB (1024² bytes)    | `1M`      | 1048576    |
+| `g` / `G` / `gib` | GiB (1024³ bytes)    | `2g`      | 2147483648 |
+
+Suffixes are **1024-based** (matching `wget --limit-rate` and the binary units
+used in the progress display). A fractional number is allowed (`1.5M` =
+1572864 B/s). An empty value, `0`, or omitting the flag means **unlimited** — no
+limiter is allocated and throughput is byte-for-byte unchanged. A negative or
+unparseable value is rejected with an error before any download starts.
+
+In a batch, the cap is **per-download**: each URL is limited independently (it
+is not divided across the batch), matching `wget`'s per-invocation-per-file
+semantics.
+
 ## Skipping completed downloads
 
 Re-running `dr` on a destination that already exists and is verifiably complete
@@ -237,7 +265,6 @@ The following are potential future work and are not yet implemented:
 - Dynamic segment adjustment based on network conditions
 - Configuration file support
 - Download queue management
-- Bandwidth limiting
 - Proxy support
 
 ## Contributing

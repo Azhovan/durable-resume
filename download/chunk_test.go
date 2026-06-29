@@ -226,7 +226,7 @@ func TestFetchChunkWritesAtOffset(t *testing.T) {
 	var sum int64
 	onBytes := func(n int64) { atomic.AddInt64(&sum, n) }
 
-	err := fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, w, onBytes)
+	err := fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, w, onBytes, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, int64(50), atomic.LoadInt64(&sum), "onBytes sum equals chunk length")
@@ -255,7 +255,7 @@ func TestFetchChunkResumeWithDone(t *testing.T) {
 	var sum int64
 	onBytes := func(n int64) { atomic.AddInt64(&sum, n) }
 
-	err := fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, w, onBytes)
+	err := fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, w, onBytes, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, int64(30), atomic.LoadInt64(&sum), "only remaining 30 bytes fetched")
@@ -275,7 +275,7 @@ func TestFetchChunkRejectsNon206(t *testing.T) {
 	ch := &chunk{index: 0, start: 0, end: 99, done: 0}
 	w := &writerAtBuf{buf: make([]byte, 100)}
 
-	err := fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, w, func(int64) {})
+	err := fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, w, func(int64) {}, nil)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrRangeNot206), "expected ErrRangeNot206, got %v", err)
 }
@@ -285,7 +285,7 @@ func TestFetchChunkNothingToDo(t *testing.T) {
 	ch := &chunk{index: 0, start: 0, end: 9, done: 10}
 	w := &writerAtBuf{buf: make([]byte, 10)}
 	called := false
-	err := fetchChunk(context.Background(), http.DefaultClient, "http://invalid.invalid", nil, ch, w, func(int64) { called = true })
+	err := fetchChunk(context.Background(), http.DefaultClient, "http://invalid.invalid", nil, ch, w, func(int64) { called = true }, nil)
 	require.NoError(t, err)
 	assert.False(t, called, "onBytes must not be called for a completed chunk")
 }
