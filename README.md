@@ -76,7 +76,7 @@ Usage: dr <url> [flags]
       --timeout duration     per-request HTTP timeout (0 = none) (default 30s)
       --retries int          per-chunk retry attempts (default 3)
   -H, --header stringArray   extra request header "Key: Value" (repeatable)
-      --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (empty/0 = unlimited)
+      --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)
   -q, --quiet                suppress progress output
   -v, --verbose              extra logging
       --version              version for dr
