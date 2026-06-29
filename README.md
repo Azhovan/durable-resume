@@ -77,6 +77,7 @@ Usage: dr <url> [flags]
       --retries int          per-chunk retry attempts (default 3)
   -H, --header stringArray   extra request header "Key: Value" (repeatable)
       --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)
+      --proxy string         route through proxy URL (http/https/socks5/socks5h); when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored
   -q, --quiet                suppress progress output
   -v, --verbose              extra logging
       --version              version for dr
@@ -189,6 +190,34 @@ In a batch, the cap is **per-download**: each URL is limited independently (it
 is not divided across the batch), matching `wget`'s per-invocation-per-file
 semantics.
 
+## Proxy support
+
+`dr` honors the standard proxy environment variables by default, exactly like
+`curl`/`wget` and Go's HTTP client: `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
+(and their lowercase forms `http_proxy`, `https_proxy`, `no_proxy`). When none
+are set, the connection is direct.
+
+Pass `--proxy <url>` to route a single invocation through an explicit proxy. It
+**overrides** the environment for that run, so the `NO_PROXY` bypass list is
+**not** consulted (an explicit `--proxy` always proxies). Accepted proxy schemes
+are `http`, `https`, `socks5`, and `socks5h` (`socks5h` delegates DNS
+resolution to the proxy). The proxy is dialed by the Go standard library, so no
+extra dependency is added.
+
+```shell
+# Honor the environment proxies (default)
+export HTTPS_PROXY=http://proxy.internal:8080
+dr https://example.com/file.zip
+
+# Override the environment for this invocation
+dr --proxy socks5://127.0.0.1:1080 https://example.com/file.zip
+```
+
+The proxy URL is validated before any download starts; an unparseable URL, a
+missing host, or an unsupported scheme is rejected up front. The **download**
+URL itself is still restricted to `http`/`https` — only the proxy URL may use
+`socks5`/`socks5h`.
+
 ## Skipping completed downloads
 
 Re-running `dr` on a destination that already exists and is verifiably complete
@@ -265,7 +294,6 @@ The following are potential future work and are not yet implemented:
 - Dynamic segment adjustment based on network conditions
 - Configuration file support
 - Download queue management
-- Proxy support
 
 ## Contributing
 

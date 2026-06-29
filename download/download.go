@@ -48,6 +48,11 @@ var (
 	ErrChecksumMismatch  = errors.New("download: checksum mismatch")
 	ErrRangeNot206       = errors.New("download: server did not honor range request")
 	ErrChunkFailed       = errors.New("download: chunk failed after retries")
+
+	// ErrInvalidProxy is returned for an unparseable proxy URL, an unsupported
+	// proxy scheme, or a proxy URL missing a host. Accepted schemes: http,
+	// https, socks5, socks5h. Callers/tests branch on it via errors.Is.
+	ErrInvalidProxy = errors.New("download: invalid proxy url")
 )
 
 // stdoutDash is the conventional "-" output value that selects stdout streaming.
@@ -95,7 +100,18 @@ type Options struct {
 	Out         *os.File      // MESSAGE sink (progress/diag); normally os.Stdout, but cmd sets os.Stderr in stdout mode (injectable). Type stays *os.File for isTTY.
 	Data        io.Writer     // DATA sink for stdout mode (Output=="-"); nil means os.Stdout via dataSink. Decoupled from the *os.File message sink; injectable for tests.
 	Client      *http.Client  // injectable for tests; nil => default built from Timeout
-	LimitRate   int64         // aggregate bytes/sec cap across all workers for THIS download; 0 = unlimited
+
+	// Proxy is an explicit proxy URL for THIS download. "" (the default) means
+	// honor the standard environment proxies (HTTP_PROXY/HTTPS_PROXY/NO_PROXY and
+	// their lowercase forms) via http.ProxyFromEnvironment. A non-empty value
+	// OVERRIDES the environment (NO_PROXY is then NOT consulted, by design) and
+	// must use scheme http, https, socks5, or socks5h. cmd validates the string
+	// before Run (see cmd.parseProxy); httpClient re-parses it when building the
+	// default transport. Ignored when Client is non-nil (the injected client is
+	// used verbatim, the test-injection seam).
+	Proxy string
+
+	LimitRate int64 // aggregate bytes/sec cap across all workers for THIS download; 0 = unlimited
 
 	// clk is an UNEXPORTED test seam: it overrides the rate limiter's clock so a
 	// same-package test can assert the COMPUTED throttle delay deterministically
@@ -120,7 +136,10 @@ func Run(ctx context.Context, opts Options) error {
 		concurrency = 1
 	}
 
-	client := httpClient(opts)
+	client, err := httpClient(opts)
+	if err != nil {
+		return err
+	}
 
 	// Build ONE shared rate limiter for this download (nil when unlimited -> a
 	// true no-op). The SAME instance is threaded into every strategy and every
@@ -497,9 +516,54 @@ func vlogf(opts Options, format string, args ...any) {
 }
 
 // httpClient returns opts.Client or a default *http.Client built from opts.Timeout.
-func httpClient(opts Options) *http.Client {
+func httpClient(opts Options) (*http.Client, error) {
+	// TEST/INJECTION SEAM: an injected client is used verbatim — never wrap it or
+	// force a transport (and thus never override its proxy). Existing tests
+	// (opts.Client = srv.Client()) depend on this; Options.Proxy is ignored here.
 	if opts.Client != nil {
-		return opts.Client
+		return opts.Client, nil
 	}
-	return &http.Client{Timeout: opts.Timeout}
+
+	// Clone the package default transport so connection pooling, TLS config,
+	// HTTP/2 enablement, and dial/idle timeouts are preserved; we override only
+	// the Proxy resolver. Clone() already sets Proxy to http.ProxyFromEnvironment,
+	// which is exactly the env-honoring default we want when no explicit proxy is set.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if opts.Proxy != "" {
+		// Explicit --proxy OVERRIDES the environment: ProxyURL returns a fixed
+		// proxy for every request, so NO_PROXY is intentionally not consulted.
+		// cmd already validated the string; re-parse here and surface
+		// ErrInvalidProxy on the (production-unreachable) failure rather than
+		// silently falling back to env.
+		pu, err := parseProxyURL(opts.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		transport.Proxy = http.ProxyURL(pu)
+	}
+	// else: leave transport.Proxy == http.ProxyFromEnvironment (env honored,
+	// including NO_PROXY and lowercase variants).
+
+	return &http.Client{Timeout: opts.Timeout, Transport: transport}, nil
+}
+
+// parseProxyURL parses and validates an explicit proxy URL string. Accepted
+// schemes: http, https, socks5, socks5h; a host is required. Empty is a
+// programmer error here (httpClient only calls it when Proxy != ""); it returns
+// ErrInvalidProxy rather than panicking.
+func parseProxyURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("download: parse proxy %q: %w", raw, ErrInvalidProxy)
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, fmt.Errorf("download: proxy scheme %q: %w", u.Scheme, ErrInvalidProxy)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("download: proxy %q: missing host: %w", raw, ErrInvalidProxy)
+	}
+	return u, nil
 }

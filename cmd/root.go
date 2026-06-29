@@ -60,6 +60,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 		verbose     bool
 		force       bool
 		limitRate   string
+		proxy       string
 	)
 
 	cmd := &cobra.Command{
@@ -87,6 +88,11 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Validate the proxy URL before assembling URLs so a malformed/unsupported
+			// value fails fast and no download (single, stdout, or batch) is started.
+			if _, err := parseProxy(proxy); err != nil {
+				return err
+			}
 
 			urls, err := assembleURLs(cmd, args, inputFile)
 			if err != nil {
@@ -112,6 +118,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				Verbose:     verbose,
 				Out:         os.Stdout,
 				LimitRate:   rate,
+				Proxy:       proxy,
 			}
 
 			stdout := output == stdoutDash
@@ -174,6 +181,9 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 	flags.BoolVarP(&force, "force", "f", false, "re-download even if the destination already exists")
 	flags.StringVar(&limitRate, "limit-rate", "",
 		"limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)")
+	flags.StringVar(&proxy, "proxy", "",
+		"route through proxy URL (http/https/socks5/socks5h); "+
+			"when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored")
 
 	return cmd
 }
@@ -244,6 +254,31 @@ func validateURL(rawURL string) error {
 	default:
 		return fmt.Errorf("scheme %q: %w", u.Scheme, download.ErrUnsupportedScheme)
 	}
+}
+
+// parseProxy validates an explicit --proxy value for fail-fast in RunE. "" =>
+// (nil, nil): no explicit proxy, the standard environment proxies are honored
+// downstream. A non-empty value must parse to a supported proxy scheme (http,
+// https, socks5, socks5h) WITH a host; otherwise it wraps download.ErrInvalidProxy.
+// It returns the parsed *url.URL for callers that want it (RunE only needs the
+// error). It is pure (no I/O), so it is directly table-testable.
+func parseProxy(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy %q: %w", raw, download.ErrInvalidProxy)
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, fmt.Errorf("invalid proxy %q: scheme %q: %w (want http, https, socks5, socks5h)", raw, u.Scheme, download.ErrInvalidProxy)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("invalid proxy %q: missing host: %w", raw, download.ErrInvalidProxy)
+	}
+	return u, nil
 }
 
 // readURLsFromFile reads URLs one per line from r. It trims surrounding

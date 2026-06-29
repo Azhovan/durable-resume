@@ -279,6 +279,93 @@ func TestRunEWiresForceIntoOptions(t *testing.T) {
 	}
 }
 
+// TestParseProxy is a pure, table-driven validator test mirroring the accepted
+// proxy schemes. Errors must wrap download.ErrInvalidProxy so callers can branch
+// on it via errors.Is.
+func TestParseProxy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"empty ok", "", false},
+		{"http", "http://p:8080", false},
+		{"https", "https://p", false},
+		{"socks5", "socks5://p:1080", false},
+		{"socks5h", "socks5h://p:1080", false},
+		{"ftp scheme", "ftp://p", true},
+		{"empty scheme", "://", true},
+		{"missing host", "http://", true},
+		{"port only no host", "http://:8080", true},
+		{"garbage", "garbage", true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			u, err := parseProxy(tt.raw)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, download.ErrInvalidProxy)
+				return
+			}
+			require.NoError(t, err)
+			if tt.raw == "" {
+				assert.Nil(t, u, "empty proxy yields a nil URL")
+			} else {
+				require.NotNil(t, u)
+			}
+		})
+	}
+}
+
+// TestRunEWiresProxyIntoOptions pins the --proxy flag -> download.Options.Proxy
+// wiring and the fail-fast validation in RunE: a valid value reaches Options and
+// runFunc is invoked; an invalid value fails before any download so runFunc is
+// never called.
+func TestRunEWiresProxyIntoOptions(t *testing.T) {
+	t.Run("good proxy wired and download started", func(t *testing.T) {
+		// Not parallel: swaps the package-level runFunc.
+		orig := runFunc
+		t.Cleanup(func() { runFunc = orig })
+
+		var captured download.Options
+		var called bool
+		runFunc = func(_ context.Context, opts download.Options) error {
+			called = true
+			captured = opts
+			return nil
+		}
+
+		cmd := NewRootCmd("v", "r", "d")
+		cmd.SetArgs([]string{"--proxy", "http://p:8080", "https://example.com/file"})
+		require.NoError(t, cmd.Execute())
+
+		require.True(t, called, "runFunc must be invoked for a valid proxy")
+		assert.Equal(t, "http://p:8080", captured.Proxy)
+	})
+
+	t.Run("bad proxy fails fast with no download", func(t *testing.T) {
+		orig := runFunc
+		t.Cleanup(func() { runFunc = orig })
+
+		var called bool
+		runFunc = func(_ context.Context, _ download.Options) error {
+			called = true
+			return nil
+		}
+
+		cmd := NewRootCmd("v", "r", "d")
+		cmd.SetArgs([]string{"--proxy", "ftp://nope", "https://example.com/file"})
+		err := cmd.Execute()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, download.ErrInvalidProxy)
+		assert.False(t, called, "no download must start when --proxy is invalid")
+	})
+}
+
 func TestReadURLsFromFile(t *testing.T) {
 	t.Parallel()
 

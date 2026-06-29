@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -642,21 +643,273 @@ func TestHTTPClient(t *testing.T) {
 	t.Run("returns injected client unchanged", func(t *testing.T) {
 		t.Parallel()
 		c := &http.Client{Timeout: 99 * time.Second}
-		got := httpClient(Options{Client: c})
+		got, err := httpClient(Options{Client: c})
+		require.NoError(t, err)
+		assert.Same(t, c, got)
+	})
+
+	t.Run("returns injected client unchanged ignoring proxy", func(t *testing.T) {
+		t.Parallel()
+		c := &http.Client{Timeout: 99 * time.Second}
+		got, err := httpClient(Options{Client: c, Proxy: "http://p:8080"})
+		require.NoError(t, err)
 		assert.Same(t, c, got)
 	})
 
 	t.Run("nil client builds one honoring timeout", func(t *testing.T) {
 		t.Parallel()
-		got := httpClient(Options{Timeout: 7 * time.Second})
+		got, err := httpClient(Options{Timeout: 7 * time.Second})
+		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, 7*time.Second, got.Timeout)
+		tr, ok := got.Transport.(*http.Transport)
+		require.True(t, ok, "expected a cloned *http.Transport")
+		require.NotNil(t, tr)
 	})
 
 	t.Run("nil client zero timeout", func(t *testing.T) {
 		t.Parallel()
-		got := httpClient(Options{})
+		got, err := httpClient(Options{})
+		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, time.Duration(0), got.Timeout)
+		tr, ok := got.Transport.(*http.Transport)
+		require.True(t, ok, "expected a cloned *http.Transport")
+		require.NotNil(t, tr)
 	})
+
+	t.Run("explicit proxy wires transport.Proxy", func(t *testing.T) {
+		t.Parallel()
+		got, err := httpClient(Options{Proxy: "http://127.0.0.1:9"})
+		require.NoError(t, err)
+		tr, ok := got.Transport.(*http.Transport)
+		require.True(t, ok)
+		require.NotNil(t, tr.Proxy)
+		u, err := tr.Proxy(httptest.NewRequest(http.MethodGet, "http://origin.example/x", nil))
+		require.NoError(t, err)
+		require.NotNil(t, u)
+		assert.Equal(t, "127.0.0.1:9", u.Host)
+	})
+
+	t.Run("invalid explicit proxy returns ErrInvalidProxy", func(t *testing.T) {
+		t.Parallel()
+		_, err := httpClient(Options{Proxy: "ftp://nope"})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidProxy)
+	})
+}
+
+// envProxyHelperEnv selects the helper-process mode of TestHTTPClientEnvProxy.
+// http.ProxyFromEnvironment reads the environment once per process and caches it
+// (sync.Once), so each env-proxy assertion must run in a FRESH process to be
+// deterministic. The parent re-execs the test binary with -run on the helper and
+// this env var set; the child resolves the proxy and prints the result.
+const (
+	envProxyHelperEnv  = "DR_TEST_ENV_PROXY_HELPER"
+	envProxyHelperReq  = "DR_TEST_ENV_PROXY_REQ"  // request URL to resolve
+	envProxyHelperOpts = "DR_TEST_ENV_PROXY_OPTS" // explicit Options.Proxy (may be "")
+)
+
+// TestHTTPClientEnvProxyHelper is not a real test: it is the child-process entry
+// point used by TestHTTPClientEnvProxy. When DR_TEST_ENV_PROXY_HELPER is unset it
+// is a no-op so a normal `go test` run skips it cleanly.
+func TestHTTPClientEnvProxyHelper(t *testing.T) {
+	if os.Getenv(envProxyHelperEnv) != "1" {
+		t.Skip("helper process entry point; only run via TestHTTPClientEnvProxy")
+	}
+	client, err := httpClient(Options{Proxy: os.Getenv(envProxyHelperOpts)})
+	if err != nil {
+		fmt.Printf("ERR %v\n", err)
+		return
+	}
+	tr := client.Transport.(*http.Transport)
+	u, err := tr.Proxy(httptest.NewRequest(http.MethodGet, os.Getenv(envProxyHelperReq), nil))
+	switch {
+	case err != nil:
+		fmt.Printf("ERR %v\n", err)
+	case u == nil:
+		fmt.Printf("DIRECT\n")
+	default:
+		fmt.Printf("PROXY %s\n", u.Host)
+	}
+}
+
+// runEnvProxyHelper re-execs the test binary into TestHTTPClientEnvProxyHelper
+// with the given environment and returns the single result line it printed.
+func runEnvProxyHelper(t *testing.T, reqURL, optsProxy string, env map[string]string) string {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHTTPClientEnvProxyHelper$", "-test.v")
+	// Start from a proxy-scrubbed copy of the parent env so ambient proxy vars
+	// (including lowercase forms) can never leak into the child. Go's
+	// httpproxy.getEnvAny skips empty values, so explicitly setting NO_PROXY=""
+	// would NOT shield against an inherited lowercase no_proxy — hence we drop
+	// every proxy var up front and re-add only what each case provides.
+	proxyVars := map[string]bool{
+		"HTTP_PROXY": true, "http_proxy": true,
+		"HTTPS_PROXY": true, "https_proxy": true,
+		"NO_PROXY": true, "no_proxy": true,
+		"ALL_PROXY": true, "all_proxy": true,
+	}
+	scrubbed := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if i := strings.IndexByte(kv, '='); i >= 0 && proxyVars[kv[:i]] {
+			continue
+		}
+		scrubbed = append(scrubbed, kv)
+	}
+	cmd.Env = append(
+		scrubbed,
+		envProxyHelperEnv+"=1",
+		envProxyHelperReq+"="+reqURL,
+		envProxyHelperOpts+"="+optsProxy,
+	)
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "helper output: %s", out)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "PROXY ") || line == "DIRECT" || strings.HasPrefix(line, "ERR ") {
+			return line
+		}
+	}
+	t.Fatalf("no result line in helper output: %s", out)
+	return ""
+}
+
+// TestHTTPClientEnvProxy covers the environment-proxy paths. http.ProxyFromEnvironment
+// caches the environment once per process, so each case runs in a fresh re-exec of
+// the test binary (see runEnvProxyHelper) — fully deterministic, dep-free, and it
+// never dials a real proxy.
+func TestHTTPClientEnvProxy(t *testing.T) {
+	t.Parallel()
+
+	t.Run("env proxy honored when unset", func(t *testing.T) {
+		t.Parallel()
+		got := runEnvProxyHelper(t, "http://example.com/x", "", map[string]string{
+			"HTTP_PROXY": "http://env-proxy:1",
+			"NO_PROXY":   "",
+		})
+		assert.Equal(t, "PROXY env-proxy:1", got)
+	})
+
+	t.Run("explicit proxy overrides env", func(t *testing.T) {
+		t.Parallel()
+		got := runEnvProxyHelper(t, "http://example.com/x", "http://explicit-proxy:2", map[string]string{
+			"HTTP_PROXY": "http://env-proxy:1",
+		})
+		assert.Equal(t, "PROXY explicit-proxy:2", got)
+	})
+
+	t.Run("NO_PROXY direct for listed host", func(t *testing.T) {
+		t.Parallel()
+		got := runEnvProxyHelper(t, "http://skip.example.com/x", "", map[string]string{
+			"HTTP_PROXY": "http://env-proxy:1",
+			"NO_PROXY":   "skip.example.com",
+		})
+		assert.Equal(t, "DIRECT", got)
+	})
+
+	t.Run("NO_PROXY still proxies other host", func(t *testing.T) {
+		t.Parallel()
+		got := runEnvProxyHelper(t, "http://other.example.com/x", "", map[string]string{
+			"HTTP_PROXY": "http://env-proxy:1",
+			"NO_PROXY":   "skip.example.com",
+		})
+		assert.Equal(t, "PROXY env-proxy:1", got)
+	})
+}
+
+// TestHTTPClientForwardProxyEndToEnd proves a real download is routed through an
+// explicit --proxy: an httptest origin holds the body, and a separate httptest
+// server acts as a forward proxy. In proxied plain HTTP the request line targets
+// the absolute origin URL, so the proxy forwards by the request's Host. The test
+// asserts the proxy handler was hit AND the downloaded bytes equal the origin body.
+func TestHTTPClientForwardProxyEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("hello through the proxy, this is the origin body")
+
+	origin := rangedServer(t, body, `"e2e"`)
+	defer origin.Close()
+
+	var proxyHits int32
+	forward := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&proxyHits, 1)
+		// Proxied HTTP carries an absolute-form request URL; forward it to origin.
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		outReq.Header = r.Header.Clone()
+		resp, err := http.DefaultClient.Do(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer forward.Close()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "downloaded.bin")
+
+	err := Run(context.Background(), Options{
+		URL:         origin.URL + "/file",
+		Output:      out,
+		Concurrency: 2,
+		Resume:      true,
+		MaxRetries:  1,
+		Timeout:     10 * time.Second,
+		Quiet:       true,
+		Proxy:       forward.URL, // opts.Client intentionally nil so httpClient builds the proxied transport
+	})
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(out)
+	require.NoError(t, err)
+	assert.Equal(t, body, got)
+	assert.Greater(t, atomic.LoadInt32(&proxyHits), int32(0), "expected the forward proxy to be hit")
+}
+
+func TestParseProxyURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"http", "http://p:8080", false},
+		{"https", "https://p", false},
+		{"socks5", "socks5://p:1080", false},
+		{"socks5h", "socks5h://p:1080", false},
+		{"ftp scheme", "ftp://p", true},
+		{"empty scheme", "://", true},
+		{"missing host", "http://", true},
+		{"port only no host", "http://:8080", true},
+		{"garbage", "garbage", true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseProxyURL(tt.raw)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrInvalidProxy)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
