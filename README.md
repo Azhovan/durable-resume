@@ -80,7 +80,7 @@ Usage: dr <url> [flags]
       --timeout duration     per-request HTTP timeout (0 = none) (default 30s)
       --retries int          per-chunk retry attempts (default 3)
   -H, --header stringArray   extra request header "Key: Value" (repeatable)
-  -m, --mirror stringArray   alternate URL serving the SAME file; tried in order if the primary fails (repeatable; one URL only)
+  -m, --mirror stringArray   alternate URL serving the SAME file; tried in order if the primary fails (repeatable). Only valid with exactly one positional URL.
       --limit-rate string    limit download speed, e.g. 500k, 1M, 1MiB, 100000 (KiB/MiB/GiB 1024-based; 0/empty = unlimited)
       --proxy string         route through proxy URL (http/https/socks5/socks5h); when unset, HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars are honored
   -q, --quiet                suppress progress output
