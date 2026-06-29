@@ -221,12 +221,6 @@ make build   # cross-builds dr; ldflags inject version, revision, date (surfaced
 make test    # go test ./... -race
 ```
 
-## Roadmap
-
-Not yet implemented:
-
-- Configuration file support
-
 ## Contributing
 
 Contributions are welcome. Please open an issue or pull request.
