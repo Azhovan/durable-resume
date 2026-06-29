@@ -70,13 +70,13 @@ func planChunks(size int64, concurrency int) []chunk {
 // successful write. Validates a 206 response (else ErrRangeNot206). Uses a fixed
 // copyBufferSize buffer, never a per-chunk buffer. Safe for concurrent use across
 // distinct chunks because WriteAt targets disjoint offsets.
-func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header, ch *chunk, w io.WriterAt, onBytes func(int64), lim rateLimiter) error {
+func fetchChunk(ctx context.Context, c *http.Client, url string, hdr http.Header, ch *chunk, w io.WriterAt, onBytes func(int64), lim rateLimiter, auth credentialSource) error {
 	offset, todo := ch.remaining()
 	if !todo {
 		return nil
 	}
 
-	req, err := newRequest(ctx, url, hdr, offset, ch.end)
+	req, err := newRequest(ctx, url, hdr, offset, ch.end, auth)
 	if err != nil {
 		return fmt.Errorf("download: build chunk request: %w", err)
 	}

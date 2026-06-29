@@ -105,7 +105,7 @@ func TestProbe(t *testing.T) {
 			srv := httptest.NewServer(tt.handler)
 			defer srv.Close()
 
-			info, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+			info, err := probe(context.Background(), srv.Client(), srv.URL, nil, nil)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantSize, info.size)
 			assert.Equal(t, tt.wantAcceptRanges, info.acceptRanges)
@@ -132,7 +132,7 @@ func TestProbeCapturesContentDispositionAndFinalURL(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		info, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+		info, err := probe(context.Background(), srv.Client(), srv.URL, nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, `attachment; filename="ubuntu.iso"`, info.contentDisposition)
 		assert.Equal(t, srv.URL, info.finalURL)
@@ -155,7 +155,7 @@ func TestProbeCapturesContentDispositionAndFinalURL(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		info, err := probe(context.Background(), srv.Client(), srv.URL+"/start", nil)
+		info, err := probe(context.Background(), srv.Client(), srv.URL+"/start", nil, nil)
 		require.NoError(t, err)
 		assert.True(t, strings.HasSuffix(info.finalURL, "/real/ubuntu.iso"), "finalURL=%q", info.finalURL)
 		assert.Equal(t, `attachment; filename="server.iso"`, info.contentDisposition)
@@ -174,7 +174,7 @@ func TestProbeCapturesContentDispositionAndFinalURL(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		info, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+		info, err := probe(context.Background(), srv.Client(), srv.URL, nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, `attachment; filename="head.bin"`, info.contentDisposition)
 		assert.Equal(t, srv.URL, info.finalURL)
@@ -195,7 +195,7 @@ func TestProbeCapturesContentDispositionAndFinalURL(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		info, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+		info, err := probe(context.Background(), srv.Client(), srv.URL, nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, `attachment; filename="get.bin"`, info.contentDisposition)
 		assert.NotEmpty(t, info.finalURL)
@@ -207,7 +207,7 @@ func TestProbeTransportErrorPropagates(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srv.Close() // immediately closed => connection refused
 
-	_, err := probe(context.Background(), srv.Client(), srv.URL, nil)
+	_, err := probe(context.Background(), srv.Client(), srv.URL, nil, nil)
 	require.Error(t, err)
 }
 
@@ -273,7 +273,7 @@ func TestNewRequest(t *testing.T) {
 
 	t.Run("sets range when both bounds non-negative", func(t *testing.T) {
 		t.Parallel()
-		req, err := newRequest(context.Background(), "http://example.com", hdr, 10, 20)
+		req, err := newRequest(context.Background(), "http://example.com", hdr, 10, 20, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "bytes=10-20", req.Header.Get("Range"))
 		assert.Equal(t, "Bearer tok", req.Header.Get("Authorization"))
@@ -282,7 +282,7 @@ func TestNewRequest(t *testing.T) {
 
 	t.Run("no range header when start negative", func(t *testing.T) {
 		t.Parallel()
-		req, err := newRequest(context.Background(), "http://example.com", hdr, -1, 20)
+		req, err := newRequest(context.Background(), "http://example.com", hdr, -1, 20, nil)
 		require.NoError(t, err)
 		assert.Empty(t, req.Header.Get("Range"))
 		assert.Equal(t, "Bearer tok", req.Header.Get("Authorization"))
@@ -290,14 +290,14 @@ func TestNewRequest(t *testing.T) {
 
 	t.Run("no range header when end negative", func(t *testing.T) {
 		t.Parallel()
-		req, err := newRequest(context.Background(), "http://example.com", hdr, 0, -1)
+		req, err := newRequest(context.Background(), "http://example.com", hdr, 0, -1, nil)
 		require.NoError(t, err)
 		assert.Empty(t, req.Header.Get("Range"))
 	})
 
 	t.Run("nil headers ok", func(t *testing.T) {
 		t.Parallel()
-		req, err := newRequest(context.Background(), "http://example.com", nil, 0, 0)
+		req, err := newRequest(context.Background(), "http://example.com", nil, 0, 0, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "bytes=0-0", req.Header.Get("Range"))
 	})

@@ -360,7 +360,7 @@ func TestFetchChunkMidStream200NotRetried(t *testing.T) {
 	ch := &chunk{index: 0, start: 0, end: 99}
 	retry := fastRetry(3)
 	err = retry(context.Background(), func() error {
-		return fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil)
+		return fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil, nil)
 	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrRangeNot206), "got %v", err)
@@ -387,7 +387,7 @@ func TestFetchChunk416NotRetried(t *testing.T) {
 	ch := &chunk{index: 0, start: 0, end: 99}
 	retry := fastRetry(3)
 	err = retry(context.Background(), func() error {
-		return fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil)
+		return fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil, nil)
 	})
 	require.Error(t, err)
 	assert.Equal(t, int32(1), calls.Load(), "416 must fail fast, not retry")
@@ -416,7 +416,7 @@ func TestFetchChunkShortReadIsRetryable(t *testing.T) {
 	defer f.Close()
 
 	ch := &chunk{index: 0, start: 0, end: 99}
-	err = fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil)
+	err = fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil, nil)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, io.ErrUnexpectedEOF), "got %v", err)
 	assert.True(t, isRetryable(err), "short read must be retryable")
@@ -444,7 +444,7 @@ func TestFetchChunkOverLength206IsFatal(t *testing.T) {
 	defer f.Close()
 
 	ch := &chunk{index: 0, start: 0, end: 9}
-	err = fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil)
+	err = fetchChunk(context.Background(), srv.Client(), srv.URL, nil, ch, f, nil, nil, nil)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrRangeNot206), "got %v", err)
 	assert.False(t, isRetryable(err), "over-length 206 must be fatal")

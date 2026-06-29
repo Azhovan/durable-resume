@@ -104,6 +104,9 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 		proxy       string
 		mirrors     []string
 		jsonOut     bool
+		user        string
+		useNetrc    bool
+		netrcFile   string
 	)
 
 	cmd := &cobra.Command{
@@ -198,12 +201,18 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 			// non-JSON return — so stdout always carries exactly one record.
 			if jsonOut && len(urls) == 1 {
 				var res download.Result
-				res.URL = urls[0]
+				res.URL = download.RedactURL(urls[0])
 				res.Size = -1 // fallback so an early-failure record still parses
 				rerr := validateURL(urls[0])
 				if rerr == nil {
+					hosts := hostnamesOf(append([]string{urls[0]}, mirrors...))
+					auth, aerr := download.NewAuth(user, useNetrc, netrcFile, hosts)
+					if aerr != nil {
+						return aerr // ErrInvalidUser / netrc read error: fail fast, no value echoed
+					}
 					base.URL = urls[0]
 					base.Mirrors = mirrors
+					base.Auth = auth
 					base.Result = &res
 					rerr = runFunc(ctx, base)
 				}
@@ -241,7 +250,7 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 				anyFailed := false
 				for _, rawURL := range urls {
 					var res download.Result
-					res.URL = rawURL
+					res.URL = download.RedactURL(rawURL)
 					res.Size = -1 // fallback so an early-failure record still parses with a valid url/size
 					var rerr error
 					switch {
@@ -250,9 +259,12 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 					default:
 						if verr := validateURL(rawURL); verr != nil {
 							rerr = verr
+						} else if auth, aerr := download.NewAuth(user, useNetrc, netrcFile, hostnamesOf([]string{rawURL})); aerr != nil {
+							rerr = aerr
 						} else {
 							opts := base
 							opts.URL = rawURL
+							opts.Auth = auth
 							opts.Result = &res
 							rerr = runFunc(ctx, opts)
 						}
@@ -286,14 +298,22 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 					// stderr so they never corrupt the piped payload.
 					base.Out = os.Stderr
 				}
+				hosts := hostnamesOf(append([]string{urls[0]}, mirrors...))
+				auth, aerr := download.NewAuth(user, useNetrc, netrcFile, hosts)
+				if aerr != nil {
+					return aerr // ErrInvalidUser / netrc read error: fail fast before any download
+				}
 				base.URL = urls[0]
 				base.Mirrors = mirrors // alternate sources for this one file (file or stdout)
+				base.Auth = auth
 				return runFunc(ctx, base)
 			}
 
 			// MULTIPLE URLs (non-json): the shared multi-URL guards above already
-			// rejected stdout / checksum / non-directory output.
-			results := runBatch(ctx, urls, base)
+			// rejected stdout / checksum / non-directory output. Auth is resolved
+			// PER URL (each URL's own host) inside runBatch; a malformed --user or
+			// netrc read error there surfaces as that URL's failure.
+			results := runBatch(ctx, urls, base, user, useNetrc, netrcFile)
 			if writeSummary(cmd.ErrOrStderr(), results) {
 				// The summary already itemized every failure on stderr; return a
 				// content-free sentinel solely to drive a non-zero exit, so main
@@ -327,6 +347,12 @@ func NewRootCmd(version, revision, date string) *cobra.Command {
 	flags.BoolVar(&jsonOut, "json", false,
 		"emit one machine-readable JSON object per download to stdout (NDJSON); "+
 			"implies --quiet for human output and cannot be combined with -o -")
+	flags.StringVar(&user, "user", "",
+		`HTTP Basic credentials "user:password" (applied per host; never logged)`)
+	flags.BoolVar(&useNetrc, "netrc", false,
+		"read credentials from ~/.netrc (or $NETRC) per host (opt-in; never read silently)")
+	flags.StringVar(&netrcFile, "netrc-file", "",
+		"read credentials from this netrc file (implies --netrc)")
 
 	// Wire shell-completion behavior (per-flag + positional) and attach the lone
 	// `completion` helper subcommand. Must run AFTER every flag is defined so
@@ -430,6 +456,20 @@ func parseProxy(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// hostnamesOf maps raw URLs to their hostnames, skipping any that do not parse
+// or carry no host. Used to scope --user to ONLY the hosts the user explicitly
+// listed (primary + mirrors), so a --user credential never follows a redirect or
+// proxy to an unlisted host.
+func hostnamesOf(urls []string) []string {
+	hosts := make([]string, 0, len(urls))
+	for _, raw := range urls {
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			hosts = append(hosts, u.Hostname())
+		}
+	}
+	return hosts
+}
+
 // readURLsFromFile reads URLs one per line from r. It trims surrounding
 // whitespace (TrimSpace also strips the trailing \r of CRLF lines), skips blank
 // lines and lines whose first non-space character is '#' (comments), and
@@ -502,7 +542,7 @@ type batchResult struct {
 // context is canceled it records the current and remaining URLs as failures
 // without calling runFunc. base already carries the multi-URL Output (a
 // directory or ""); only URL is set per iteration.
-func runBatch(ctx context.Context, urls []string, base download.Options) []batchResult {
+func runBatch(ctx context.Context, urls []string, base download.Options, user string, useNetrc bool, netrcFile string) []batchResult {
 	results := make([]batchResult, 0, len(urls))
 	for _, rawURL := range urls {
 		if err := ctx.Err(); err != nil {
@@ -513,8 +553,14 @@ func runBatch(ctx context.Context, urls []string, base download.Options) []batch
 			results = append(results, batchResult{url: rawURL, err: err})
 			continue
 		}
+		auth, aerr := download.NewAuth(user, useNetrc, netrcFile, hostnamesOf([]string{rawURL}))
+		if aerr != nil {
+			results = append(results, batchResult{url: rawURL, err: aerr})
+			continue
+		}
 		opts := base
 		opts.URL = rawURL
+		opts.Auth = auth
 		results = append(results, batchResult{url: rawURL, err: runFunc(ctx, opts)})
 	}
 	return results
@@ -532,7 +578,7 @@ func writeSummary(w io.Writer, results []batchResult) (failed bool) {
 	fmt.Fprintf(w, "dr: %d of %d downloads succeeded\n", succeeded, len(results))
 	for _, res := range results {
 		if res.err != nil {
-			fmt.Fprintf(w, "dr: %s: %v\n", res.url, res.err)
+			fmt.Fprintf(w, "dr: %s: %v\n", download.RedactURL(res.url), res.err)
 		}
 	}
 	return succeeded < len(results)

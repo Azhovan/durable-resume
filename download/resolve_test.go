@@ -82,13 +82,20 @@ func TestUrlBasename(t *testing.T) {
 		{"no path", "https://h", ""},
 		{"encoded dotdot", "https://h/%2e%2e", ".."},
 		{"nested encoded dotdot", "https://h/sub/%2e%2e", ".."},
+		// userinfo lives in u.User, never in u.Path, so it must never reach the
+		// derived filename (requirement (f): stripped from the derived name).
+		{"userinfo not in name", "https://alice:supersecret@example.com/path/file.bin", "file.bin"},
 	}
 
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tt.want, urlBasename(tt.in))
+			got := urlBasename(tt.in)
+			assert.Equal(t, tt.want, got)
+			assert.NotContains(t, got, "alice")
+			assert.NotContains(t, got, "supersecret")
+			assert.NotContains(t, got, "@")
 		})
 	}
 }

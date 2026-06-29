@@ -107,7 +107,7 @@ func TestRunSegmented_DownloadsFullPayload(t *testing.T) {
 	var got int64
 	onBytes := func(n int64) { atomic.AddInt64(&got, n) }
 
-	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, statePath, chunks, 4, onBytes, fastRetry(2), nil)
+	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, statePath, chunks, 4, onBytes, fastRetry(2), nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(payload)), atomic.LoadInt64(&got))
 
@@ -128,7 +128,7 @@ func TestRunSegmented_NeverExceedsConcurrency(t *testing.T) {
 
 	st := newState(srv.URL, remoteInfo{size: int64(len(payload))}, concurrency, chunks)
 
-	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, statePath(dstPath), chunks, concurrency, func(int64) {}, fastRetry(1), nil)
+	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, statePath(dstPath), chunks, concurrency, func(int64) {}, fastRetry(1), nil, nil)
 	require.NoError(t, err)
 	assert.LessOrEqual(t, atomic.LoadInt64(&maxSeen), int64(concurrency),
 		"in-flight workers exceeded concurrency")
@@ -159,7 +159,7 @@ func TestRunSegmented_ContextCancelReturnsPromptly(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- runSegmented(ctx, srv.Client(), srv.URL, nil, dst, st, statePath(dstPath), chunks, 4, func(int64) {}, fastRetry(1), nil)
+		done <- runSegmented(ctx, srv.Client(), srv.URL, nil, dst, st, statePath(dstPath), chunks, 4, func(int64) {}, fastRetry(1), nil, nil)
 	}()
 
 	select {
@@ -185,7 +185,7 @@ func TestRunSegmented_ChunkAlways500_AbortsWithErrChunkFailed(t *testing.T) {
 	chunks := planChunks(int64(len(payload)), 4)
 	st := newState(srv.URL, remoteInfo{size: int64(len(payload))}, 4, chunks)
 
-	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, statePath(dstPath), chunks, 4, func(int64) {}, fastRetry(2), nil)
+	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, statePath(dstPath), chunks, 4, func(int64) {}, fastRetry(2), nil, nil)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrChunkFailed)
 }
@@ -200,7 +200,7 @@ func TestRunSegmented_SavesSidecar(t *testing.T) {
 	st := newState(srv.URL, remoteInfo{size: int64(len(payload))}, 2, chunks)
 	sp := statePath(dstPath)
 
-	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, sp, chunks, 2, func(int64) {}, fastRetry(2), nil)
+	err := runSegmented(context.Background(), srv.Client(), srv.URL, nil, dst, st, sp, chunks, 2, func(int64) {}, fastRetry(2), nil, nil)
 	require.NoError(t, err)
 
 	_, statErr := os.Stat(sp)
@@ -232,7 +232,7 @@ func TestRunSingle_StreamsFullBody(t *testing.T) {
 		mu.Unlock()
 	}
 
-	n, err := runSingle(context.Background(), srv.Client(), srv.URL, nil, dst, onBytes, nil)
+	n, err := runSingle(context.Background(), srv.Client(), srv.URL, nil, dst, onBytes, nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(payload)), n)
 	assert.Equal(t, int64(len(payload)), got)

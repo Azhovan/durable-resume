@@ -142,6 +142,16 @@ type Options struct {
 
 	LimitRate int64 // aggregate bytes/sec cap across all workers for THIS download; 0 = unlimited
 
+	// Auth is the host-aware Basic credential source for THIS download. nil
+	// (the default and every existing test) => NO Authorization header is ever
+	// added and the request path is byte-for-byte unchanged. Consulted per
+	// REQUEST host inside newRequest/headFallback (applyAuth), so a credential
+	// for the primary host is NEVER sent to a different-host mirror. Build via
+	// NewAuth; nil means no auth. It is an exported field of an unexported
+	// interface type, so it carries no json tag (the --json Result is
+	// unaffected) and cannot be hand-implemented outside this package.
+	Auth credentialSource
+
 	// Result is an OPTIONAL output seam: when non-nil, Run populates it with the
 	// structured outcome (resolved path, bytes, size, sha256, resumed, skipped,
 	// source) on BOTH success and failure paths, for the cmd layer's --json
@@ -230,7 +240,7 @@ func Run(ctx context.Context, opts Options) error {
 	// Seed the always-known fields + unknown-size default so even an early-failure
 	// record is well-formed (valid url, size present as -1 until probed).
 	setResult(opts, func(r *Result) {
-		r.URL = opts.URL
+		r.URL = redactURL(opts.URL)
 		r.Size = -1
 	})
 
@@ -259,7 +269,7 @@ func Run(ctx context.Context, opts Options) error {
 	// 1. PROBE the PRIMARY once, to resolve the output name and check
 	// skip-if-complete BEFORE trying any source. This keeps the output naming +
 	// State.URL keyed on the primary so failover never renames the output.
-	primaryInfo, perr := probe(ctx, client, opts.URL, opts.Header)
+	primaryInfo, perr := probe(ctx, client, opts.URL, opts.Header, opts.Auth)
 	if perr != nil {
 		// A real cancel/deadline aborts immediately, even on the primary probe.
 		if ctxCanceled(ctx) {
@@ -294,7 +304,7 @@ func Run(ctx context.Context, opts Options) error {
 			skippedf(opts)
 			return nil
 		}
-		vlogf(opts, "probe: primary failed (%v); resolved %q from URL and entering failover", perr, resolved)
+		vlogf(opts, "probe: primary failed (%v); resolved %q from URL and entering failover", perr, redactURL(resolved))
 		return runSources(ctx, client, opts, lim, nil) // nil => source[0] self-probes
 	}
 	vlogf(opts, "probe: size=%d acceptRanges=%t etag=%q lastModified=%q", primaryInfo.size, primaryInfo.acceptRanges, primaryInfo.etag, primaryInfo.lastModified)
@@ -312,7 +322,7 @@ func Run(ctx context.Context, opts Options) error {
 		r.Output = opts.Output
 		r.Size = primaryInfo.size
 	})
-	vlogf(opts, "output: resolved %q (cd=%q finalURL=%q)", resolved, primaryInfo.contentDisposition, primaryInfo.finalURL)
+	vlogf(opts, "output: resolved %q (cd=%q finalURL=%q)", resolved, primaryInfo.contentDisposition, redactURL(primaryInfo.finalURL))
 
 	// 2b. SKIP-IF-COMPLETE once, before trying ANY source: when the final file
 	// already exists and is verifiably complete (and --force is not set),
@@ -355,7 +365,7 @@ func runSources(ctx context.Context, client *http.Client, opts Options, lim rate
 		if err == nil {
 			setResult(opts, func(r *Result) {
 				if r.Source == "" {
-					r.Source = srcs[0]
+					r.Source = redactURL(srcs[0])
 				}
 			})
 			savedf(opts)
@@ -375,7 +385,7 @@ func runSources(ctx context.Context, client *http.Client, opts Options, lim rate
 		if err == nil {
 			setResult(opts, func(r *Result) {
 				if r.Source == "" {
-					r.Source = src
+					r.Source = redactURL(src)
 				}
 			})
 			savedf(opts)
@@ -385,9 +395,9 @@ func runSources(ctx context.Context, client *http.Client, opts Options, lim rate
 		if ctxCanceled(ctx) || isCtxErr(err) {
 			return err
 		}
-		errs = append(errs, fmt.Errorf("source %d (%s): %w", i+1, src, err))
+		errs = append(errs, fmt.Errorf("source %d (%s): %w", i+1, redactURL(src), err))
 		if i < len(srcs)-1 {
-			vlogf(opts, "mirror: source %d (%s) failed (%v); trying next", i+1, src, err)
+			vlogf(opts, "mirror: source %d (%s) failed (%v); trying next", i+1, redactURL(src), err)
 		}
 	}
 	// errors.Join lets errors.Is match BOTH ErrAllSourcesFailed and every wrapped
@@ -408,12 +418,12 @@ func attempt(ctx context.Context, client *http.Client, opts Options, source stri
 	if reuse != nil {
 		info = *reuse
 	} else {
-		probed, err := probe(ctx, client, source, opts.Header)
+		probed, err := probe(ctx, client, source, opts.Header, opts.Auth)
 		if err != nil {
 			return fmt.Errorf("download: probe: %w", err) // transport error advances
 		}
 		info = probed
-		vlogf(opts, "probe: source=%s size=%d acceptRanges=%t etag=%q lastModified=%q", source, info.size, info.acceptRanges, info.etag, info.lastModified)
+		vlogf(opts, "probe: source=%s size=%d acceptRanges=%t etag=%q lastModified=%q", redactURL(source), info.size, info.acceptRanges, info.etag, info.lastModified)
 	}
 
 	if !info.streamable() {
@@ -440,10 +450,10 @@ func runStdoutSources(ctx context.Context, client *http.Client, opts Options, li
 		if ctxCanceled(ctx) {
 			return ctx.Err()
 		}
-		info, err := probe(ctx, client, src, opts.Header)
+		info, err := probe(ctx, client, src, opts.Header, opts.Auth)
 		var emitted int64
 		if err == nil {
-			vlogf(opts, "strategy: single sequential stream to stdout (source=%s; no .part/resume/rename)", src)
+			vlogf(opts, "strategy: single sequential stream to stdout (source=%s; no .part/resume/rename)", redactURL(src))
 			emitted, err = runStdoutStream(ctx, client, opts, info, lim, src)
 		}
 		if err == nil {
@@ -458,13 +468,13 @@ func runStdoutSources(ctx context.Context, client *http.Client, opts Options, li
 		if len(srcs) == 1 {
 			return err
 		}
-		errs = append(errs, fmt.Errorf("source %d (%s): %w", i+1, src, err))
+		errs = append(errs, fmt.Errorf("source %d (%s): %w", i+1, redactURL(src), err))
 		if emitted > 0 {
 			// Bytes already on the wire: failover would corrupt the stream. Stop.
 			return fmt.Errorf("%w: %w", ErrAllSourcesFailed, errors.Join(errs...))
 		}
 		if i < len(srcs)-1 {
-			vlogf(opts, "mirror: stdout source %d (%s) failed (%v); trying next", i+1, src, err)
+			vlogf(opts, "mirror: stdout source %d (%s) failed (%v); trying next", i+1, redactURL(src), err)
 		}
 	}
 	return fmt.Errorf("%w: %w", ErrAllSourcesFailed, errors.Join(errs...))
@@ -516,7 +526,7 @@ func runStdoutStream(ctx context.Context, client *http.Client, opts Options, inf
 
 	onBytes := func(n int64) { prog.Add(n) }
 
-	n, err := copyToStream(ctx, client, source, opts.Header, dst, onBytes, lim)
+	n, err := copyToStream(ctx, client, source, opts.Header, dst, onBytes, lim, opts.Auth)
 	if err != nil {
 		return n, err
 	}
@@ -560,7 +570,7 @@ func runSingleStream(ctx context.Context, client *http.Client, opts Options, inf
 	retry := newRetry(opts.MaxRetries, 1*time.Millisecond, nil)
 	err = retry(ctx, func() error {
 		prog.Seed(0)
-		_, runErr := runSingle(ctx, client, source, opts.Header, dst, onBytes, lim)
+		_, runErr := runSingle(ctx, client, source, opts.Header, dst, onBytes, lim, opts.Auth)
 		return runErr
 	})
 	if err != nil {
@@ -709,7 +719,7 @@ func runSegmentedDownload(ctx context.Context, client *http.Client, opts Options
 
 	// 6. DOWNLOAD via bounded worker pool.
 	retry := newRetry(opts.MaxRetries, 1*time.Millisecond, nil)
-	dlErr := runSegmented(ctx, client, source, opts.Header, dst, st, sp, chunks, concurrency, onBytes, retry, lim)
+	dlErr := runSegmented(ctx, client, source, opts.Header, dst, st, sp, chunks, concurrency, onBytes, retry, lim, opts.Auth)
 	if dlErr != nil {
 		// 7. INTERRUPT / failure: retain sidecar + partial file. Pool already
 		// flushed state on exit; nothing to remove.

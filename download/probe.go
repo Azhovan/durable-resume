@@ -26,8 +26,8 @@ func (r remoteInfo) streamable() bool {
 // probe issues GET Range: bytes=0-0; interprets 206 (Content-Range total, ranges
 // supported), 200 (Content-Length, no ranges), and 405/other via a HEAD fallback.
 // Never hard-fails on a streamable non-206 response; only transport errors propagate.
-func probe(ctx context.Context, c *http.Client, url string, hdr http.Header) (remoteInfo, error) {
-	req, err := newRequest(ctx, url, hdr, 0, 0)
+func probe(ctx context.Context, c *http.Client, url string, hdr http.Header, auth credentialSource) (remoteInfo, error) {
+	req, err := newRequest(ctx, url, hdr, 0, 0, auth)
 	if err != nil {
 		return remoteInfo{size: -1}, err
 	}
@@ -65,19 +65,20 @@ func probe(ctx context.Context, c *http.Client, url string, hdr http.Header) (re
 		// 405 / other non-streamable status (e.g. range not allowed): try a HEAD
 		// fallback to learn size and whether ranges are advertised. Never hard-fail
 		// here; only transport errors propagate.
-		return headFallback(ctx, c, url, hdr, info)
+		return headFallback(ctx, c, url, hdr, info, auth)
 	}
 }
 
 // headFallback issues a HEAD request, learning size from Content-Length and
 // acceptRanges from "Accept-Ranges: bytes". The base info (etag/lastModified)
 // is carried over and overridden when the HEAD response provides values.
-func headFallback(ctx context.Context, c *http.Client, url string, hdr http.Header, base remoteInfo) (remoteInfo, error) {
+func headFallback(ctx context.Context, c *http.Client, url string, hdr http.Header, base remoteInfo, auth credentialSource) (remoteInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
 		return base, err
 	}
 	copyHeaders(req, hdr)
+	applyAuth(req, auth)
 
 	resp, err := c.Do(req)
 	if err != nil {
@@ -159,7 +160,7 @@ func parseContentRangeTotal(v string) (total int64, ok bool) {
 
 // newRequest builds a GET request with caller headers and, when start>=0 && end>=0,
 // a Range: bytes=start-end header. start<0 means no Range header.
-func newRequest(ctx context.Context, url string, hdr http.Header, start, end int64) (*http.Request, error) {
+func newRequest(ctx context.Context, url string, hdr http.Header, start, end int64, auth credentialSource) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -168,6 +169,7 @@ func newRequest(ctx context.Context, url string, hdr http.Header, start, end int
 	if start >= 0 && end >= 0 {
 		req.Header.Set("Range", "bytes="+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10))
 	}
+	applyAuth(req, auth) // host-aware; no-op when no creds apply (-H already wins)
 	return req, nil
 }
 

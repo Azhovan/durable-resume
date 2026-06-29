@@ -142,6 +142,35 @@ dr https://example.com/file.zip                                  # honor env (de
 dr --proxy socks5://127.0.0.1:1080 https://example.com/file.zip  # override for this run
 ```
 
+### Authentication (HTTP Basic, `--user` / `.netrc`)
+
+`dr` can attach an HTTP **Basic** credential without hand-base64ing an `Authorization` header. Two opt-in sources, applied **per host** so a credential is never sent to a host it wasn't issued for:
+
+- `--user <user:password>` — a single Basic credential (like `curl -u`). The first `:` splits, so passwords may contain `:`; a missing `:` means an empty password. It is scoped to **only the hosts you explicitly listed** (the primary URL plus every `--mirror`), so it never follows a redirect or failover to an unlisted host. There is **no short flag** (deliberately, to avoid shell-history exposure).
+- `--netrc` — opt **in** to reading `~/.netrc` (or `$NETRC`) and applying `machine <host> login <user> password <pass>` entries per host, with a `default` entry as fallback. Unlike `wget`, `dr` never reads `.netrc` silently; you must pass `--netrc`. Use `--netrc-file <path>` to point at a specific file (it implies `--netrc`). File-location precedence is `--netrc-file` > `$NETRC` > `~/.netrc`. A **missing** file is not an error (just no credentials).
+
+The `.netrc` grammar supported: whitespace/newline-separated tokens; `machine`, `login`, `password`, `default`; `macdef <name>` blocks are skipped (body up to the next blank line); `#` begins a comment **at a token boundary only** (so a value like `pa#ss` keeps its `#`); double-quoted tokens (`"two words"`, with `\"` and `\\` escapes) let a login or password contain spaces or a `#`; unknown keywords' values are ignored; a later `machine` for the same host overrides. Hosts are matched case-insensitively with the port stripped (IPv6 literals are kept intact, so distinct addresses never share a credential).
+
+A URL may also carry credentials directly (`https://user:pass@host/path`); `dr` honors that for that request only.
+
+**Precedence** per request host, highest first:
+
+| Source | Notes |
+|---|---|
+| `-H "Authorization: ..."` | an explicitly set header is **never** overridden |
+| URL userinfo | `https://user:pass@host/…` — for that request only |
+| `--user` | applied only to your listed hosts (primary + mirrors) |
+| `.netrc` | `machine <host>`, then the `default` entry |
+| (none match) | no `Authorization` header is added |
+
+**Scope: Basic only** (no Digest/NTLM/Bearer). **Redaction is total:** passwords and URL userinfo never appear in `--verbose` logs, `--json` records (URLs are redacted to `redacted@host`, and there is no password field), error messages, or the derived output filename. When no auth flags and no URL userinfo are in play the request is byte-for-byte identical to an unauthenticated download.
+
+```shell
+dr --user alice:secret https://example.com/private.iso
+dr --netrc https://example.com/private.iso                       # read ~/.netrc per host
+dr --netrc-file ./ci.netrc https://example.com/private.iso       # explicit file
+```
+
 ### Machine-readable output (`--json`)
 
 `--json` emits **NDJSON** — one compact JSON object per download — to stdout (implying `--quiet` for human output). A single URL emits one line; a batch streams one line per URL as each completes, so a pipeline sees results incrementally and survives a mid-batch kill. Records are emitted for both success and failure (each carries `url`, `success`, and on failure `error`); a batch still exits non-zero if any URL failed. `--json` cannot be combined with `-o -`.
@@ -168,6 +197,8 @@ Run `dr --help` for the full, always-current flag list and defaults. The most-us
 | `--proxy` | route through a proxy URL |
 | `--json` | emit NDJSON to stdout |
 | `-H, --header` | extra request header (repeatable) |
+| `--user` | HTTP Basic credentials `user:password` (per host; never logged) |
+| `--netrc` / `--netrc-file` | read Basic credentials from `~/.netrc`/`$NETRC` (opt-in) or a specific file |
 | `--timeout` | per-request HTTP timeout (default 30s; 0 = none) |
 | `--retries` | per-chunk retry attempts (default 3) |
 | `-q, --quiet` / `-v, --verbose` | suppress / increase logging |
